@@ -1,0 +1,1255 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DriveLedger</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #ffffff; font-family: 'Inter', system-ui, sans-serif; -webkit-font-smoothing: antialiased; color: #14171f; }
+  button, input, select { font-family: inherit; }
+  @keyframes fadeUp { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+</style>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/plain" id="app-source">
+const { useState, useEffect, useRef } = React;
+
+// ---------- constants (ported from the original app) ----------
+
+const PLATFORM_COLORS = {
+  'Uber': '#06C167', 'Uber Eats': '#05a356', 'Lyft': '#EA0B8C', 'Skip the Dishes': '#FF8000',
+  'DoorDash': '#EF4444', 'Instacart': '#43B02A', 'Other': '#8b93a3'
+};
+const CATEGORY_COLORS = {
+  'Gas': '#f2b26b', 'Maintenance': '#e06b8b', 'Phone Bill': '#6ba7f2', 'Car Wash': '#6bd0f2',
+  'Parking/Tolls': '#c39bf0', 'Car Loan': '#34d399', 'Insurance': '#0ea5e9', 'Platform Fees': '#f0b429',
+  'Subscriptions': '#95b8f6', 'Other': '#8b93a3'
+};
+const LOAN = { principal: 15750, apr: 0.0899, payment: 86.94, start: '2026-07-02', termYears: 5 };
+
+// Approximate 2026 tax parameters (estimates only)
+const FED_BRACKETS = [
+  { upTo: 58523, rate: 0.14 },
+  { upTo: 117045, rate: 0.205 },
+  { upTo: 181440, rate: 0.26 },
+  { upTo: 258482, rate: 0.29 },
+  { upTo: Infinity, rate: 0.33 }
+];
+const FED_BPA = 16452;
+const QC_BRACKETS = [
+  { upTo: 53255, rate: 0.14 },
+  { upTo: 106495, rate: 0.19 },
+  { upTo: 132245, rate: 0.24 },
+  { upTo: Infinity, rate: 0.2575 }
+];
+const QC_BPA = 18952;
+const QUEBEC_ABATEMENT = 0.165;
+const QPP_RATE = 0.119;
+const QPP_EXEMPTION = 3500;
+const QPP_YMPE = 74600;
+const QPP2_RATE = 0.08;
+const QPP2_CEILING = 85000;
+
+function bracketTax(income, brackets) {
+  let tax = 0, prev = 0;
+  for (const b of brackets) {
+    if (income > prev) {
+      const amt = Math.min(income, b.upTo) - prev;
+      tax += amt * b.rate;
+      prev = b.upTo;
+    } else break;
+  }
+  return tax;
+}
+
+function calcTax(netIncome) {
+  const ni = Math.max(0, netIncome);
+  const fedGross = Math.max(0, bracketTax(ni, FED_BRACKETS) - FED_BPA * 0.14);
+  const federal = fedGross * (1 - QUEBEC_ABATEMENT);
+  const quebec = Math.max(0, bracketTax(ni, QC_BRACKETS) - QC_BPA * 0.14);
+  const pensionable = Math.max(0, Math.min(ni, QPP_YMPE) - QPP_EXEMPTION);
+  const qpp = pensionable * QPP_RATE;
+  const qpp2 = ni > QPP_YMPE ? (Math.min(ni, QPP2_CEILING) - QPP_YMPE) * QPP2_RATE : 0;
+  const total = federal + quebec + qpp + qpp2;
+  return { federal, quebec, qpp: qpp + qpp2, total };
+}
+
+function localISO(d) { return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0'); }
+function todayStr() { return localISO(new Date()); }
+function parseDate(s) { const [y,m,d] = s.split('-').map(Number); return new Date(y, m-1, d); }
+function fmtDate(d) { return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }); }
+function fmtDateShort(d) { return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }); }
+function money(n) { return '$' + (Math.round(n*100)/100).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
+function startOfWeek(d) { const x = new Date(d); const day = x.getDay(); const diff = (day === 0 ? -6 : 1) - day; x.setDate(x.getDate() + diff); x.setHours(0,0,0,0); return x; }
+function endOfWeek(d) { const s = startOfWeek(d); const e = new Date(s); e.setDate(e.getDate() + 6); e.setHours(23,59,59,999); return e; }
+function startOfMonth(d) { return new Date(d.getFullYear(), d.getMonth(), 1); }
+function endOfMonth(d) { return new Date(d.getFullYear(), d.getMonth()+1, 0, 23,59,59,999); }
+function inPeriod(dateStr, period, today) {
+  const d = parseDate(dateStr);
+  if (period === 'all') return true;
+  if (period === 'week') return d >= startOfWeek(today) && d <= endOfWeek(today);
+  if (period === 'month') return d >= startOfMonth(today) && d <= endOfMonth(today);
+  return true;
+}
+
+// turns a CSS-string (as used in the original design) into a React style object
+function sx(str, extra) {
+  const obj = {};
+  (str || '').split(';').forEach(rule => {
+    const idx = rule.indexOf(':');
+    if (idx === -1) return;
+    const prop = rule.slice(0, idx).trim();
+    const val = rule.slice(idx + 1).trim();
+    if (!prop || val === '') return;
+    const camel = prop.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+    obj[camel] = val;
+  });
+  return extra ? { ...obj, ...extra } : obj;
+}
+
+function blankStatementForm() {
+  const t = new Date();
+  const month = t.getFullYear() + '-' + String(t.getMonth() + 1).padStart(2, '0');
+  return { platform: 'Uber', month, grossFares: '', tips: '', otherIncome: '', fees: '', gstCollected: '', qstCollected: '', gstRemitted: '', qstRemitted: '', kmOnTrip: '', kmOnline: '' };
+}
+
+function buildLoanSchedule() {
+  const rows = [];
+  let balance = LOAN.principal;
+  const weeklyRate = LOAN.apr / 52;
+  let d = parseDate(LOAN.start);
+  let n = 1;
+  const maxN = LOAN.termYears * 52 + 4;
+  while (balance > 0.01 && n <= maxN) {
+    const interest = balance * weeklyRate;
+    let principalPaid = LOAN.payment - interest;
+    if (principalPaid > balance) principalPaid = balance;
+    const paymentAmt = principalPaid + interest;
+    balance = Math.max(0, balance - principalPaid);
+    rows.push({ n, date: new Date(d), payment: paymentAmt, principal: principalPaid, interest, balance });
+    d = new Date(d); d.setDate(d.getDate() + 7);
+    n++;
+  }
+  return rows;
+}
+
+function getInsuranceRates(insuranceRates) {
+  const rates = (insuranceRates && insuranceRates.length) ? [...insuranceRates] : [];
+  return rates.sort((a, b) => (a.start < b.start ? -1 : 1));
+}
+
+function insuranceRateOn(insuranceRates, dateStr) {
+  const rates = getInsuranceRates(insuranceRates);
+  if (!rates.length) return { start: dateStr, monthly: 0 };
+  let cur = rates[0];
+  for (const r of rates) { if (r.start <= dateStr) cur = r; }
+  return cur;
+}
+
+function getRecurringExpenses(schedule, upTo, insuranceRates) {
+  const out = [];
+  schedule.forEach(r => {
+    if (r.date <= upTo) {
+      out.push({ id: 'loan-' + r.n, date: localISO(r.date), category: 'Car Loan', amount: r.payment, note: 'Weekly payment', auto: true, removable: false });
+    }
+  });
+  const SUB = { name: 'Shopify', amount: 22.98, day: 12 };
+  let sd = new Date(upTo.getFullYear(), 0, SUB.day);
+  let sGuard = 0;
+  while (sd <= upTo && sGuard < 24) {
+    out.push({ id: 'sub-shopify-' + sd.getFullYear() + '-' + sd.getMonth(), date: localISO(sd), category: 'Subscriptions', amount: SUB.amount, note: SUB.name + ' — monthly', auto: true, removable: false });
+    sd = new Date(sd.getFullYear(), sd.getMonth() + 1, SUB.day);
+    sGuard++;
+  }
+  const insRates = getInsuranceRates(insuranceRates);
+  if (insRates.length) {
+    const firstStart = parseDate(insRates[0].start);
+    const billDay = firstStart.getDate();
+    let m = firstStart;
+    let guard = 0;
+    while (m <= upTo && guard < 240) {
+      const rate = insuranceRateOn(insuranceRates, localISO(m));
+      out.push({ id: 'ins-' + m.getFullYear() + '-' + m.getMonth(), date: localISO(m), category: 'Insurance', amount: rate.monthly, note: 'Monthly premium', auto: true, removable: false });
+      m = new Date(m.getFullYear(), m.getMonth()+1, billDay);
+      guard++;
+    }
+  }
+  return out;
+}
+
+const toCss = (o) => Object.entries(o).map(([k,v]) => k.replace(/[A-Z]/g, m => '-'+m.toLowerCase())+':'+v).join(';');
+
+// ---------- API helpers ----------
+
+async function api(path, opts) {
+  const res = await fetch('/api' + path, {
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'same-origin',
+    ...opts
+  });
+  if (res.status === 401) { const err = new Error('Not authenticated'); err.authError = true; throw err; }
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || ('Request failed (' + res.status + ')'));
+  }
+  if (res.status === 204) return null;
+  return res.json();
+}
+
+// ---------- Login screen ----------
+
+function LoginScreen({ clientId, onSignedIn, authError }) {
+  const btnRef = useRef(null);
+
+  useEffect(() => {
+    if (!clientId) return;
+    function init() {
+      if (!window.google || !window.google.accounts || !window.google.accounts.id) {
+        setTimeout(init, 100);
+        return;
+      }
+      window.google.accounts.id.initialize({
+        client_id: clientId,
+        callback: async (response) => {
+          try {
+            const result = await api('/auth/google', { method: 'POST', body: JSON.stringify({ credential: response.credential }) });
+            onSignedIn(result.email);
+          } catch (e) {
+            onSignedIn(null, e.message);
+          }
+        }
+      });
+      if (btnRef.current) {
+        window.google.accounts.id.renderButton(btnRef.current, { theme: 'outline', size: 'large', width: 280 });
+      }
+    }
+    init();
+  }, [clientId]);
+
+  return (
+    <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#faf9f5' }}>
+      <div style={{ background: '#ffffff', border: '1px solid #e6e8ec', borderRadius: '20px', padding: '40px', width: '340px', textAlign: 'center' }}>
+        <div style={{ width: '48px', height: '48px', borderRadius: '12px', background: 'linear-gradient(135deg,#34d399,#0ea5e9)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: "'Space Grotesk',sans-serif", fontWeight: 700, color: '#08120e', fontSize: '20px', margin: '0 auto 18px' }}>D</div>
+        <div style={{ fontFamily: "'Space Grotesk',sans-serif", fontWeight: 700, fontSize: '20px', marginBottom: '6px' }}>DriveLedger</div>
+        <div style={{ fontSize: '13px', color: '#6b7280', marginBottom: '26px' }}>Sign in with your Google account to access your income &amp; expense data.</div>
+        {clientId ? (
+          <div ref={btnRef} style={{ display: 'flex', justifyContent: 'center' }} />
+        ) : (
+          <div style={{ fontSize: '12.5px', color: '#dc6547' }}>Server isn't configured with a Google Client ID yet — set GOOGLE_CLIENT_ID in .env.</div>
+        )}
+        {authError && <div style={{ fontSize: '12.5px', color: '#dc6547', marginTop: '16px' }}>{authError}</div>}
+      </div>
+    </div>
+  );
+}
+
+// ---------- Main App ----------
+
+function App() {
+  const [authState, setAuthState] = useState('checking'); // checking | signed-out | signed-in
+  const [authError, setAuthError] = useState('');
+  const [userEmail, setUserEmail] = useState(null);
+  const [clientId, setClientId] = useState(null);
+
+  const [income, setIncome] = useState(null);
+  const [expenses, setExpenses] = useState(null);
+  const [statements, setStatements] = useState(null);
+  const [insuranceRates, setInsuranceRates] = useState(null);
+  const [loadError, setLoadError] = useState('');
+
+  const [tab, setTab] = useState('overview');
+  const [period, setPeriod] = useState('week');
+
+  const [showIncomeForm, setShowIncomeForm] = useState(false);
+  const [editingIncomeId, setEditingIncomeId] = useState(null);
+  const [incomeForm, setIncomeForm] = useState({ platform: 'Uber', date: todayStr(), hours: '', amount: '' });
+  const [incomeFormError, setIncomeFormError] = useState('');
+
+  const [showExpenseForm, setShowExpenseForm] = useState(false);
+  const [editingExpenseId, setEditingExpenseId] = useState(null);
+  const [expenseForm, setExpenseForm] = useState({ category: 'Gas', date: todayStr(), amount: '', note: '', custom: '' });
+
+  const [incomeView, setIncomeView] = useState('shifts');
+  const [showStatementForm, setShowStatementForm] = useState(false);
+  const [editingStatementId, setEditingStatementId] = useState(null);
+  const [statementForm, setStatementForm] = useState(blankStatementForm());
+
+  const [expandedYears, setExpandedYears] = useState({});
+  const [taxView, setTaxView] = useState('ytd');
+
+  const [showInsuranceForm, setShowInsuranceForm] = useState(false);
+  const [insuranceForm, setInsuranceForm] = useState({ monthly: '', start: todayStr() });
+
+  useEffect(() => { checkAuth(); }, []);
+
+  async function checkAuth() {
+    try {
+      const cfg = await fetch('/api/auth/config').then(r => r.json());
+      setClientId(cfg.clientId);
+      const me = await fetch('/api/auth/me').then(r => r.json());
+      if (me.authenticated) {
+        setUserEmail(me.email);
+        setAuthState('signed-in');
+        loadData();
+      } else {
+        setAuthState('signed-out');
+      }
+    } catch (e) {
+      setAuthState('signed-out');
+    }
+  }
+
+  function handleSignedIn(email, error) {
+    if (email) {
+      setUserEmail(email);
+      setAuthState('signed-in');
+      setAuthError('');
+      loadData();
+    } else {
+      setAuthError(error || 'Sign-in failed');
+    }
+  }
+
+  async function handleLogout() {
+    await api('/auth/logout', { method: 'POST' }).catch(() => {});
+    if (window.google && window.google.accounts && window.google.accounts.id) {
+      window.google.accounts.id.disableAutoSelect();
+    }
+    setUserEmail(null);
+    setAuthState('signed-out');
+    setIncome(null); setExpenses(null); setStatements(null); setInsuranceRates(null);
+  }
+
+  async function loadData() {
+    try {
+      const data = await api('/data');
+      setIncome(data.income);
+      setExpenses(data.expenses);
+      setStatements(data.statements);
+      setInsuranceRates(data.insuranceRates);
+    } catch (e) {
+      if (e.authError) { setAuthState('signed-out'); return; }
+      setLoadError(e.message);
+    }
+  }
+
+  // ---------- Income CRUD ----------
+
+  async function submitIncome() {
+    const f = incomeForm;
+    const amount = parseFloat(f.amount);
+    if (!amount || amount <= 0 || !f.date) {
+      setIncomeFormError(!f.date ? 'Please pick a date.' : 'Please enter an amount greater than $0.');
+      return;
+    }
+    setIncomeFormError('');
+    const payload = { date: f.date, platform: f.platform, amount, hours: f.hours ? parseFloat(f.hours) : null };
+    try {
+      if (editingIncomeId) {
+        const row = await api('/income/' + editingIncomeId, { method: 'PUT', body: JSON.stringify(payload) });
+        setIncome(income.map(r => r.id === editingIncomeId ? row : r));
+      } else {
+        const row = await api('/income', { method: 'POST', body: JSON.stringify(payload) });
+        setIncome([row, ...income]);
+      }
+      setShowIncomeForm(false);
+      setEditingIncomeId(null);
+      setIncomeForm({ platform: 'Uber', date: todayStr(), hours: '', amount: '' });
+    } catch (e) {
+      setIncomeFormError(e.message);
+    }
+  }
+
+  function editIncome(row) {
+    setShowIncomeForm(true);
+    setEditingIncomeId(row.id);
+    setIncomeForm({ platform: row.platform, date: row.date, hours: row.hours != null ? String(row.hours) : '', amount: String(row.amount) });
+  }
+
+  async function removeIncome(id) {
+    await api('/income/' + id, { method: 'DELETE' }).catch(() => {});
+    setIncome(income.filter(r => r.id !== id));
+    if (editingIncomeId === id) { setEditingIncomeId(null); setShowIncomeForm(false); }
+  }
+
+  // ---------- Expense CRUD ----------
+
+  async function submitExpense() {
+    const f = expenseForm;
+    const amount = parseFloat(f.amount);
+    if (!amount || amount <= 0 || !f.date) return;
+    const category = f.category === 'Other' && f.custom && f.custom.trim() ? f.custom.trim() : f.category;
+    const payload = { date: f.date, category, amount, note: f.note || '' };
+    if (editingExpenseId) {
+      const row = await api('/expenses/' + editingExpenseId, { method: 'PUT', body: JSON.stringify(payload) });
+      setExpenses(expenses.map(r => r.id === editingExpenseId ? row : r));
+    } else {
+      const row = await api('/expenses', { method: 'POST', body: JSON.stringify(payload) });
+      setExpenses([row, ...expenses]);
+    }
+    setShowExpenseForm(false);
+    setEditingExpenseId(null);
+    setExpenseForm({ category: 'Gas', date: todayStr(), amount: '', note: '', custom: '' });
+  }
+
+  function editExpense(row) {
+    const known = ['Gas','Maintenance','Phone Bill','Car Wash','Parking/Tolls'];
+    setShowExpenseForm(true);
+    setEditingExpenseId(row.id);
+    setExpenseForm({
+      category: known.includes(row.category) ? row.category : 'Other',
+      custom: known.includes(row.category) ? '' : row.category,
+      date: row.date, amount: String(row.amount), note: row.note || ''
+    });
+  }
+
+  async function removeExpense(id) {
+    await api('/expenses/' + id, { method: 'DELETE' }).catch(() => {});
+    setExpenses(expenses.filter(r => r.id !== id));
+    if (editingExpenseId === id) { setEditingExpenseId(null); setShowExpenseForm(false); }
+  }
+
+  // ---------- Statement CRUD ----------
+
+  async function submitStatement() {
+    const f = statementForm;
+    const num = (v) => { const n = parseFloat(v); return isFinite(n) && n > 0 ? n : 0; };
+    if (!f.month) return;
+    const totalIncome = num(f.grossFares) + num(f.tips) + num(f.otherIncome);
+    if (totalIncome <= 0) return;
+    const payload = { platform: f.platform, month: f.month, grossFares: num(f.grossFares), tips: num(f.tips), otherIncome: num(f.otherIncome), fees: num(f.fees), gstCollected: num(f.gstCollected), qstCollected: num(f.qstCollected), gstRemitted: num(f.gstRemitted), qstRemitted: num(f.qstRemitted), kmOnTrip: num(f.kmOnTrip), kmOnline: num(f.kmOnline) };
+    if (editingStatementId) {
+      const row = await api('/statements/' + editingStatementId, { method: 'PUT', body: JSON.stringify(payload) });
+      setStatements(statements.map(r => r.id === editingStatementId ? row : r));
+    } else {
+      const row = await api('/statements', { method: 'POST', body: JSON.stringify(payload) });
+      setStatements([row, ...statements]);
+    }
+    setShowStatementForm(false);
+    setEditingStatementId(null);
+    setStatementForm(blankStatementForm());
+  }
+
+  function editStatement(s) {
+    const str = (v) => v ? String(v) : '';
+    setIncomeView('statements');
+    setShowStatementForm(true);
+    setEditingStatementId(s.id);
+    setStatementForm({ platform: s.platform, month: s.month, grossFares: str(s.grossFares), tips: str(s.tips), otherIncome: str(s.otherIncome), fees: str(s.fees), gstCollected: str(s.gstCollected), qstCollected: str(s.qstCollected), gstRemitted: str(s.gstRemitted), qstRemitted: str(s.qstRemitted), kmOnTrip: str(s.kmOnTrip), kmOnline: str(s.kmOnline) });
+  }
+
+  async function removeStatement(id) {
+    await api('/statements/' + id, { method: 'DELETE' }).catch(() => {});
+    setStatements(statements.filter(r => r.id !== id));
+    if (editingStatementId === id) { setEditingStatementId(null); setShowStatementForm(false); }
+  }
+
+  // ---------- Insurance CRUD ----------
+
+  async function submitInsuranceRate() {
+    const f = insuranceForm;
+    const monthly = parseFloat(f.monthly);
+    if (!monthly || monthly <= 0 || !f.start) return;
+    const rates = await api('/insurance-rates', { method: 'POST', body: JSON.stringify({ start: f.start, monthly }) });
+    setInsuranceRates(rates);
+    setShowInsuranceForm(false);
+    setInsuranceForm({ monthly: '', start: todayStr() });
+  }
+
+  async function removeInsuranceRate(start) {
+    if (insuranceRates.length <= 1) return;
+    await api('/insurance-rates/' + encodeURIComponent(start), { method: 'DELETE' }).catch(() => {});
+    setInsuranceRates(insuranceRates.filter(r => r.start !== start));
+  }
+
+  if (authState === 'checking') {
+    return <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#8a90a0', fontSize: '14px' }}>Loading…</div>;
+  }
+  if (authState === 'signed-out') {
+    return <LoginScreen clientId={clientId} onSignedIn={handleSignedIn} authError={authError} />;
+  }
+  if (income === null || expenses === null || statements === null || insuranceRates === null) {
+    return (
+      <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#8a90a0', fontSize: '14px' }}>
+        {loadError ? ('Error loading data: ' + loadError) : 'Loading your data…'}
+      </div>
+    );
+  }
+
+  return (
+    <Dashboard
+      userEmail={userEmail} onLogout={handleLogout}
+      income={income} expenses={expenses} statements={statements} insuranceRates={insuranceRates}
+      tab={tab} setTab={setTab} period={period} setPeriod={setPeriod}
+      showIncomeForm={showIncomeForm} setShowIncomeForm={setShowIncomeForm}
+      editingIncomeId={editingIncomeId} incomeForm={incomeForm} setIncomeForm={setIncomeForm}
+      incomeFormError={incomeFormError} submitIncome={submitIncome} editIncome={editIncome} removeIncome={removeIncome}
+      showExpenseForm={showExpenseForm} setShowExpenseForm={setShowExpenseForm}
+      editingExpenseId={editingExpenseId} expenseForm={expenseForm} setExpenseForm={setExpenseForm}
+      submitExpense={submitExpense} editExpense={editExpense} removeExpense={removeExpense}
+      incomeView={incomeView} setIncomeView={setIncomeView}
+      showStatementForm={showStatementForm} setShowStatementForm={setShowStatementForm}
+      editingStatementId={editingStatementId} statementForm={statementForm} setStatementForm={setStatementForm}
+      submitStatement={submitStatement} editStatement={editStatement} removeStatement={removeStatement}
+      expandedYears={expandedYears} setExpandedYears={setExpandedYears}
+      taxView={taxView} setTaxView={setTaxView}
+      showInsuranceForm={showInsuranceForm} setShowInsuranceForm={setShowInsuranceForm}
+      insuranceForm={insuranceForm} setInsuranceForm={setInsuranceForm}
+      submitInsuranceRate={submitInsuranceRate} removeInsuranceRate={removeInsuranceRate}
+    />
+  );
+}
+
+// ---------- Dashboard (computes derived values + renders tabs) ----------
+
+function Dashboard(p) {
+  const today = new Date();
+  const income = p.income, expenses = p.expenses, statements = p.statements, insuranceRates = p.insuranceRates;
+  const period = p.period, tab = p.tab;
+
+  const schedule = buildLoanSchedule();
+  const recurring = getRecurringExpenses(schedule, today, insuranceRates);
+
+  const stmtDate = (s) => { const parts = s.month.split('-').map(Number); return new Date(parts[0], parts[1], 0); };
+  const stmtIncome = (s) => (s.grossFares || 0) + (s.tips || 0) + (s.otherIncome || 0);
+  const stmtFeeExpenses = statements.filter(s => (s.fees || 0) > 0).map(s => ({ id: 'stmt-fee-' + s.id, date: localISO(stmtDate(s)), category: 'Platform Fees', amount: s.fees, note: s.platform + ' statement fees', auto: true, removable: false }));
+  const incomeEvents = [...income.map(r => ({ date: r.date, amount: r.amount })), ...statements.map(s => ({ date: localISO(stmtDate(s)), amount: stmtIncome(s) }))];
+
+  const allExpenses = [...expenses, ...recurring, ...stmtFeeExpenses];
+
+  const periodIncome = income.filter(r => inPeriod(r.date, period, today));
+  const periodStatements = statements.filter(s => inPeriod(localISO(stmtDate(s)), period, today));
+  const periodExpenses = allExpenses.filter(r => inPeriod(r.date, period, today));
+
+  const gross = periodIncome.reduce((s,r) => s + r.amount, 0) + periodStatements.reduce((s,r) => s + stmtIncome(r), 0);
+  const totalExp = periodExpenses.reduce((s,r) => s + r.amount, 0);
+  const net = gross - totalExp;
+  const margin = gross > 0 ? Math.round((net/gross)*100) : 0;
+
+  const periodLabelMap = { week: 'This week', month: 'This month', all: 'All time' };
+
+  const platMap = {}; const platHours = {};
+  periodIncome.forEach(r => {
+    platMap[r.platform] = (platMap[r.platform]||0) + r.amount;
+    if (r.hours) platHours[r.platform] = (platHours[r.platform]||0) + r.hours;
+  });
+  periodStatements.forEach(s => { platMap[s.platform] = (platMap[s.platform]||0) + stmtIncome(s); });
+  const maxPlat = Math.max(1, ...Object.values(platMap), 0);
+  const platformBreakdown = Object.keys(platMap).sort((a,b) => platMap[b]-platMap[a]).map(name => ({
+    name, amountLabel: money(platMap[name]), pct: Math.round((platMap[name]/maxPlat)*100), color: PLATFORM_COLORS[name] || '#8b93a3',
+    rateLabel: platHours[name] > 0 ? money(platMap[name]/platHours[name]) + '/hr' : ''
+  }));
+  const periodHours = periodIncome.reduce((s,r) => s + (r.hours || 0), 0);
+  const grossSubLabel = periodLabelMap[period] + (periodHours > 0 && gross > 0 ? ' · ' + money(gross/periodHours) + '/hr avg' : '');
+
+  const weeklyTrend = [];
+  let trendMax = 1;
+  const trendRaw = [];
+  for (let i = 7; i >= 0; i--) {
+    const ws = startOfWeek(today); ws.setDate(ws.getDate() - i*7);
+    const we = new Date(ws); we.setDate(we.getDate() + 6); we.setHours(23,59,59,999);
+    const inc = incomeEvents.filter(r => { const d = parseDate(r.date); return d >= ws && d <= we; }).reduce((s,r) => s + r.amount, 0);
+    const exp = allExpenses.filter(r => { const d = parseDate(r.date); return d >= ws && d <= we; }).reduce((s,r) => s + r.amount, 0);
+    const wNet = inc - exp;
+    trendRaw.push({ ws, wNet, inc, exp });
+    trendMax = Math.max(trendMax, Math.abs(wNet));
+  }
+  trendRaw.forEach(({ ws, wNet, inc, exp }) => {
+    const hPct = Math.max(3, Math.round(Math.abs(wNet)/trendMax*100));
+    weeklyTrend.push({
+      label: fmtDateShort(ws),
+      netShort: (wNet < 0 ? '-$' : '$') + Math.round(Math.abs(wNet)).toLocaleString('en-US'),
+      numColor: wNet >= 0 ? '#059669' : '#dc6547',
+      barStyle: 'width:100%; border-radius:6px 6px 3px 3px; height:' + hPct + '%; background:' + (wNet >= 0 ? 'linear-gradient(180deg,#34d399,#0ea5e9)' : '#e8907a'),
+      tip: 'Week of ' + fmtDateShort(ws) + ' — income ' + money(inc) + ', expenses ' + money(exp) + ', net ' + money(wNet)
+    });
+  });
+
+  const catMap = {};
+  periodExpenses.forEach(r => { catMap[r.category] = (catMap[r.category]||0) + r.amount; });
+  const maxCat = Math.max(1, ...Object.values(catMap), 0);
+  const expenseBreakdown = Object.keys(catMap).sort((a,b) => catMap[b]-catMap[a]).map(name => ({
+    name, amountLabel: money(catMap[name]), pct: Math.round((catMap[name]/maxCat)*100), color: CATEGORY_COLORS[name] || '#8b93a3'
+  }));
+
+  const incomeList = [...periodIncome].sort((a,b) => b.date.localeCompare(a.date)).map(r => ({
+    ...r, color: PLATFORM_COLORS[r.platform] || '#8b93a3', dateLabel: fmtDateShort(parseDate(r.date)),
+    hoursLabel: r.hours ? ' · ' + r.hours + 'h' : '', amountLabel: money(r.amount)
+  }));
+
+  const expenseList = [...periodExpenses].sort((a,b) => b.date.localeCompare(a.date)).map(r => ({
+    ...r, color: CATEGORY_COLORS[r.category] || '#8b93a3', dateLabel: fmtDateShort(parseDate(r.date)),
+    noteLabel: r.note ? ' · ' + r.note : '', amountLabel: money(r.amount), removable: r.removable !== false
+  }));
+
+  const currentBalance = (() => {
+    let b = LOAN.principal;
+    for (const r of schedule) { if (r.date <= today) b = r.balance; else break; }
+    return b;
+  })();
+  const paidSoFar = LOAN.principal - currentBalance;
+  const paidPct = Math.min(100, Math.round((paidSoFar / LOAN.principal) * 1000) / 10);
+  const nextRow = schedule.find(r => r.date > today);
+  const lastRow = schedule[schedule.length - 1];
+
+  const yearMap = {};
+  schedule.forEach(r => { const y = r.date.getFullYear(); if (!yearMap[y]) yearMap[y] = []; yearMap[y].push(r); });
+  const currentYear = today.getFullYear();
+  const years = Object.keys(yearMap).sort().map(y => {
+    const rows = yearMap[y];
+    const principalSum = rows.reduce((s,r) => s + r.principal, 0);
+    const interestSum = rows.reduce((s,r) => s + r.interest, 0);
+    const expanded = p.expandedYears[y] !== undefined ? p.expandedYears[y] : (Number(y) === currentYear);
+    return {
+      year: y, countLabel: rows.length + ' payments', principalLabel: money(principalSum), interestLabel: money(interestSum),
+      expanded, arrowRotate: expanded ? 'rotate(90deg)' : 'rotate(0deg)',
+      toggle: () => p.setExpandedYears({ ...p.expandedYears, [y]: !expanded }),
+      rows: rows.map(r => ({ n: r.n, dateLabel: fmtDateShort(r.date), principalLabel: money(r.principal), interestLabel: money(r.interest), balanceLabel: money(r.balance) }))
+    };
+  });
+
+  const insRatesList = getInsuranceRates(insuranceRates);
+  const insCurrent = insuranceRateOn(insuranceRates, localISO(today));
+  const insuranceHistory = insRatesList.map((r, i) => ({
+    rangeLabel: 'from ' + fmtDate(parseDate(r.start)), amountLabel: money(r.monthly), removable: i > 0, start: r.start
+  })).reverse();
+
+  const monthLabel = (m) => { const parts = m.split('-').map(Number); return new Date(parts[0], parts[1]-1, 1).toLocaleDateString('en-US', { month: 'long', year: 'numeric' }); };
+  const stmtList = [...statements].sort((a,b) => b.month.localeCompare(a.month)).map(s => {
+    const gstNet = Math.max(0, (s.gstCollected||0) + (s.qstCollected||0) - (s.gstRemitted||0) - (s.qstRemitted||0));
+    const km = (s.kmOnTrip||0) + (s.kmOnline||0);
+    return {
+      id: s.id, title: s.platform + ' — ' + monthLabel(s.month), color: PLATFORM_COLORS[s.platform] || '#8b93a3',
+      incomeLabel: money(stmtIncome(s)), feesLabel: money(s.fees || 0), netLabel: money(stmtIncome(s) - (s.fees || 0)),
+      gstNetLabel: money(gstNet), kmLabel: km > 0 ? (s.kmOnTrip||0) + ' km on-trip · ' + (s.kmOnline||0) + ' km online' : '', raw: s
+    };
+  });
+  const incomeCountLabel = p.incomeView === 'statements' ? (stmtList.length + ' monthly statements') : (periodLabelMap[period] + ' · ' + incomeList.length + ' shifts logged');
+
+  // --- tax calculator ---
+  const yearStart = new Date(today.getFullYear(), 0, 1);
+  const inYtd = (d) => d >= yearStart && d <= today;
+  const deductibleCats = ['Gas', 'Maintenance', 'Phone Bill', 'Car Wash', 'Parking/Tolls'];
+  const catLabels = { 'Gas': 'Gas', 'Maintenance': 'Maintenance/repairs', 'Phone Bill': 'Phone bill', 'Car Wash': 'Car washes', 'Parking/Tolls': 'Parking/tolls' };
+
+  const ytdGross = incomeEvents.filter(r => inYtd(parseDate(r.date))).reduce((s,r) => s + r.amount, 0);
+  const ytdStmtFees = statements.filter(s => inYtd(stmtDate(s))).reduce((sum,s) => sum + (s.fees || 0), 0);
+
+  const manualByCat = {};
+  expenses.filter(r => inYtd(parseDate(r.date)) && deductibleCats.includes(r.category)).forEach(r => {
+    manualByCat[r.category] = (manualByCat[r.category] || 0) + r.amount;
+  });
+  const ytdInsurance = recurring.filter(r => r.category === 'Insurance' && inYtd(parseDate(r.date))).reduce((s,r) => s + r.amount, 0);
+  const ytdSubscriptions = recurring.filter(r => r.category === 'Subscriptions' && inYtd(parseDate(r.date))).reduce((s,r) => s + r.amount, 0);
+  const ytdLoanInterest = schedule.filter(r => inYtd(r.date)).reduce((s,r) => s + r.interest, 0);
+  const ytdManualDeductible = Object.values(manualByCat).reduce((s,v) => s+v, 0);
+  const ytdDeductible = ytdManualDeductible + ytdInsurance + ytdLoanInterest + ytdStmtFees + ytdSubscriptions;
+  const ytdNet = Math.max(0, ytdGross - ytdDeductible);
+
+  const daysElapsed = Math.max(1, Math.floor((today - yearStart) / 86400000) + 1);
+  const projectedNet = ytdNet * (365 / daysElapsed);
+  const netIncomeUsed = p.taxView === 'projected' ? projectedNet : ytdNet;
+  const taxResult = calcTax(netIncomeUsed);
+  const effectiveRate = netIncomeUsed > 0 ? (taxResult.total / netIncomeUsed) * 100 : 0;
+  const weeklySetAside = p.taxView === 'projected' ? taxResult.total / 52 : taxResult.total / (daysElapsed / 7);
+
+  const deductions = [
+    ...Object.keys(manualByCat).map(cat => ({ name: catLabels[cat] || cat, amountLabel: money(manualByCat[cat]) })),
+    ...(ytdStmtFees > 0 ? [{ name: 'Platform fees (statements)', amountLabel: money(ytdStmtFees) }] : []),
+    ...(ytdInsurance > 0 ? [{ name: 'Insurance', amountLabel: money(ytdInsurance) }] : []),
+    ...(ytdSubscriptions > 0 ? [{ name: 'Subscriptions (Shopify)', amountLabel: money(ytdSubscriptions) }] : []),
+    ...(ytdLoanInterest > 0 ? [{ name: 'Car loan interest', amountLabel: money(ytdLoanInterest) }] : [])
+  ];
+
+  const rideshareGross = income.filter(r => inYtd(parseDate(r.date)) && (r.platform === 'Uber' || r.platform === 'Lyft')).reduce((s,r) => s + r.amount, 0);
+  const gstAmt = rideshareGross * 0.05 / 1.14975;
+  const qstAmt = rideshareGross * 0.09975 / 1.14975;
+  const ytdStmtsGst = statements.filter(s => inYtd(stmtDate(s)));
+  const stCollected = ytdStmtsGst.reduce((sum,s) => sum + (s.gstCollected || 0) + (s.qstCollected || 0), 0);
+  const stRemitted = ytdStmtsGst.reduce((sum,s) => sum + (s.gstRemitted || 0) + (s.qstRemitted || 0), 0);
+  const stNet = Math.max(0, stCollected - stRemitted);
+  const gst = {
+    grossLabel: money(rideshareGross), gstLabel: money(gstAmt), qstLabel: money(qstAmt),
+    hasStatements: ytdStmtsGst.length > 0, stCollectedLabel: money(stCollected), stRemittedLabel: '-' + money(stRemitted),
+    totalLabel: money(gstAmt + qstAmt + stNet)
+  };
+
+  const tax = {
+    gst, yearLabel: today.getFullYear() + (p.taxView === 'projected' ? ' (projected)' : ' (year-to-date)'),
+    netIncomeLabel: money(netIncomeUsed), totalTaxLabel: money(taxResult.total), federalLabel: money(taxResult.federal),
+    quebecLabel: money(taxResult.quebec), qppLabel: money(taxResult.qpp), weeklySetAsideLabel: money(weeklySetAside),
+    effectiveRateLabel: Math.round(effectiveRate * 10) / 10 + '%', totalDeductionsLabel: money(ytdDeductible), deductions
+  };
+
+  const tabBtn = (name) => sx('flex:1; min-width:100px; text-align:center; padding:10px 14px; border-radius:8px; border:none; font-size:13px; font-weight:600; cursor:pointer; white-space:nowrap', {
+    background: tab === name ? '#eef1f5' : 'transparent', color: tab === name ? '#14171f' : '#6b7280'
+  });
+  const periodBtn = (name) => sx('padding:8px 14px; border-radius:7px; border:none; font-size:12.5px; font-weight:600; cursor:pointer', {
+    background: period === name ? '#eef1f5' : 'transparent', color: period === name ? '#14171f' : '#6b7280'
+  });
+  const incomeViewBtn = (name) => sx('padding:8px 14px; border-radius:7px; border:none; font-size:12.5px; font-weight:600; cursor:pointer', {
+    background: p.incomeView === name ? '#eef1f5' : 'transparent', color: p.incomeView === name ? '#14171f' : '#6b7280'
+  });
+  const taxViewBtn = (name) => sx('padding:8px 14px; border-radius:7px; border:none; font-size:12.5px; font-weight:600; cursor:pointer', {
+    background: p.taxView === name ? '#eef1f5' : 'transparent', color: p.taxView === name ? '#14171f' : '#6b7280'
+  });
+
+  const totals = { grossLabel: money(gross), expensesLabel: money(totalExp), netLabel: money(net), grossSubLabel, netColor: net >= 0 ? '#059669' : '#dc6547', marginLabel: gross > 0 ? margin + '% margin' : '—' };
+  const loan = {
+    principalLabel: money(LOAN.principal), paymentLabel: money(LOAN.payment), balanceLabel: money(currentBalance), paidSoFarLabel: money(paidSoFar),
+    paidPct, paidPctLabel: paidPct, startLabel: fmtDate(parseDate(LOAN.start)), payoffLabel: lastRow ? fmtDate(lastRow.date) : '—',
+    nextPaymentLabel: nextRow ? fmtDateShort(nextRow.date) : 'Paid off', years
+  };
+
+  return (
+    <div style={{ minHeight: '100vh', background: '#ffffff', color: '#14171f', paddingBottom: '60px' }}>
+      <div style={{ maxWidth: '1080px', margin: '0 auto', padding: '28px 20px 0' }}>
+
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '16px', marginBottom: '22px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+            <div style={{ width: '36px', height: '36px', borderRadius: '10px', background: 'linear-gradient(135deg,#34d399,#0ea5e9)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: "'Space Grotesk',sans-serif", fontWeight: 700, color: '#08120e', fontSize: '16px' }}>D</div>
+            <div style={{ fontFamily: "'Space Grotesk',sans-serif", fontWeight: 700, fontSize: '19px', letterSpacing: '-0.2px' }}>DriveLedger</div>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '14px' }}>
+            <div style={{ display: 'flex', background: '#ffffff', border: '1px solid #e6e8ec', borderRadius: '10px', padding: '3px' }}>
+              <button style={periodBtn('week')} onClick={() => p.setPeriod('week')}>Week</button>
+              <button style={periodBtn('month')} onClick={() => p.setPeriod('month')}>Month</button>
+              <button style={periodBtn('all')} onClick={() => p.setPeriod('all')}>All time</button>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12.5px', color: '#6b7280' }}>
+              <span>{p.userEmail}</span>
+              <button onClick={p.onLogout} style={{ background: 'none', border: '1px solid #e2e5ea', color: '#6b7280', borderRadius: '7px', padding: '6px 10px', fontSize: '12px', cursor: 'pointer' }}>Sign out</button>
+            </div>
+          </div>
+        </div>
+
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(220px,1fr))', gap: '14px', marginBottom: '22px' }}>
+          <div style={{ background: '#ffffff', border: '1px solid #e6e8ec', borderRadius: '16px', padding: '20px' }}>
+            <div style={{ fontSize: '12px', color: '#6b7280', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.5px' }}>Gross income</div>
+            <div style={{ fontFamily: "'Space Grotesk',sans-serif", fontSize: '30px', fontWeight: 700, marginTop: '8px', color: '#059669' }}>{totals.grossLabel}</div>
+            <div style={{ fontSize: '12px', color: '#8a90a0', marginTop: '6px' }}>{totals.grossSubLabel}</div>
+          </div>
+          <div style={{ background: '#ffffff', border: '1px solid #e6e8ec', borderRadius: '16px', padding: '20px' }}>
+            <div style={{ fontSize: '12px', color: '#6b7280', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.5px' }}>Total expenses</div>
+            <div style={{ fontFamily: "'Space Grotesk',sans-serif", fontSize: '30px', fontWeight: 700, marginTop: '8px', color: '#dc6547' }}>{totals.expensesLabel}</div>
+            <div style={{ fontSize: '12px', color: '#8a90a0', marginTop: '6px' }}>incl. loan + insurance</div>
+          </div>
+          <div style={{ background: '#ffffff', border: '1px solid #e6e8ec', borderRadius: '16px', padding: '20px' }}>
+            <div style={{ fontSize: '12px', color: '#6b7280', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.5px' }}>Net profit</div>
+            <div style={{ fontFamily: "'Space Grotesk',sans-serif", fontSize: '30px', fontWeight: 700, marginTop: '8px', color: totals.netColor }}>{totals.netLabel}</div>
+            <div style={{ fontSize: '12px', color: '#8a90a0', marginTop: '6px' }}>{totals.marginLabel}</div>
+          </div>
+        </div>
+
+        <div style={{ display: 'flex', gap: '6px', background: '#ffffff', border: '1px solid #e6e8ec', borderRadius: '12px', padding: '5px', marginBottom: '22px', overflowX: 'auto' }}>
+          <button style={tabBtn('overview')} onClick={() => p.setTab('overview')}>Overview</button>
+          <button style={tabBtn('income')} onClick={() => p.setTab('income')}>Income</button>
+          <button style={tabBtn('expenses')} onClick={() => p.setTab('expenses')}>Expenses</button>
+          <button style={tabBtn('loan')} onClick={() => p.setTab('loan')}>Car Loan</button>
+          <button style={tabBtn('tax')} onClick={() => p.setTab('tax')}>Tax Calculator</button>
+        </div>
+
+        {tab === 'overview' && (
+          <div style={{ display: 'grid', gridTemplateColumns: '1.3fr 1fr', gap: '16px' }}>
+            <div style={{ background: '#ffffff', border: '1px solid #e6e8ec', borderRadius: '16px', padding: '22px', minWidth: 0 }}>
+              <div style={{ fontFamily: "'Space Grotesk',sans-serif", fontWeight: 600, fontSize: '15px', marginBottom: '16px' }}>Income by platform</div>
+              {platformBreakdown.map((pl, i) => (
+                <div key={i} style={{ marginBottom: '14px' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '13px', marginBottom: '6px' }}>
+                    <span style={{ display: 'flex', alignItems: 'center', gap: '8px' }}><span style={{ width: '9px', height: '9px', borderRadius: '50%', background: pl.color, display: 'inline-block' }}></span>{pl.name}</span>
+                    <span style={{ display: 'flex', alignItems: 'baseline', gap: '8px' }}><span style={{ color: '#8a90a0', fontSize: '11.5px' }}>{pl.rateLabel}</span><span style={{ color: '#3a3f4b', fontWeight: 600 }}>{pl.amountLabel}</span></span>
+                  </div>
+                  <div style={{ height: '8px', background: '#f5f6f8', borderRadius: '6px', overflow: 'hidden' }}>
+                    <div style={{ height: '100%', borderRadius: '6px', background: pl.color, width: pl.pct + '%' }}></div>
+                  </div>
+                </div>
+              ))}
+              {platformBreakdown.length === 0 && <div style={{ fontSize: '13px', color: '#8a90a0', padding: '8px 0' }}>No income logged for this period yet.</div>}
+            </div>
+
+            <div style={{ background: '#ffffff', border: '1px solid #e6e8ec', borderRadius: '16px', padding: '22px', minWidth: 0 }}>
+              <div style={{ fontFamily: "'Space Grotesk',sans-serif", fontWeight: 600, fontSize: '15px', marginBottom: '16px' }}>Expenses by category</div>
+              {expenseBreakdown.map((c, i) => (
+                <div key={i} style={{ marginBottom: '14px' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '13px', marginBottom: '6px' }}>
+                    <span style={{ display: 'flex', alignItems: 'center', gap: '8px' }}><span style={{ width: '9px', height: '9px', borderRadius: '50%', background: c.color, display: 'inline-block' }}></span>{c.name}</span>
+                    <span style={{ color: '#3a3f4b', fontWeight: 600 }}>{c.amountLabel}</span>
+                  </div>
+                  <div style={{ height: '8px', background: '#f5f6f8', borderRadius: '6px', overflow: 'hidden' }}>
+                    <div style={{ height: '100%', borderRadius: '6px', background: c.color, width: c.pct + '%' }}></div>
+                  </div>
+                </div>
+              ))}
+              {expenseBreakdown.length === 0 && <div style={{ fontSize: '13px', color: '#8a90a0', padding: '8px 0' }}>No expenses logged for this period yet.</div>}
+            </div>
+
+            <div style={{ gridColumn: '1/-1', background: '#ffffff', border: '1px solid #e6e8ec', borderRadius: '16px', padding: '22px' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', flexWrap: 'wrap', gap: '8px', marginBottom: '18px' }}>
+                <div style={{ fontFamily: "'Space Grotesk',sans-serif", fontWeight: 600, fontSize: '15px' }}>Net profit by week</div>
+                <div style={{ fontSize: '12px', color: '#8a90a0' }}>last 8 weeks · income minus all expenses</div>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'flex-end', gap: '10px' }}>
+                {weeklyTrend.map((w, i) => (
+                  <div key={i} style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '6px' }} title={w.tip}>
+                    <div style={{ fontSize: '10.5px', fontWeight: 600, color: w.numColor }}>{w.netShort}</div>
+                    <div style={{ height: '110px', width: '100%', maxWidth: '46px', display: 'flex', alignItems: 'flex-end', justifyContent: 'center' }}>
+                      <div style={sx(w.barStyle)}></div>
+                    </div>
+                    <div style={{ fontSize: '10.5px', color: '#8a90a0', whiteSpace: 'nowrap' }}>{w.label}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div style={{ gridColumn: '1/-1', background: 'linear-gradient(135deg,#f7f8fa,#eef2f7)', border: '1px solid #e6e8ec', borderRadius: '16px', padding: '22px', display: 'flex', alignItems: 'center', gap: '26px', flexWrap: 'wrap' }}>
+              <div style={{ flex: 1, minWidth: '220px' }}>
+                <div style={{ fontFamily: "'Space Grotesk',sans-serif", fontWeight: 600, fontSize: '15px', marginBottom: '4px' }}>Car loan payoff</div>
+                <div style={{ fontSize: '12px', color: '#6b7280', marginBottom: '14px' }}>Balance remaining · next payment {loan.nextPaymentLabel}</div>
+                <div style={{ height: '10px', background: '#f5f6f8', borderRadius: '6px', overflow: 'hidden', marginBottom: '10px' }}>
+                  <div style={{ height: '100%', borderRadius: '6px', background: 'linear-gradient(90deg,#34d399,#0ea5e9)', width: loan.paidPct + '%' }}></div>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '12px', color: '#6b7280' }}>
+                  <span>{loan.paidSoFarLabel} paid</span>
+                  <span>{loan.balanceLabel} left of {loan.principalLabel}</span>
+                </div>
+              </div>
+              <button style={{ background: '#f5f6f8', border: '1px solid #e2e5ea', color: '#14171f', fontSize: '13px', fontWeight: 600, padding: '11px 18px', borderRadius: '10px', cursor: 'pointer', whiteSpace: 'nowrap' }} onClick={() => p.setTab('loan')}>View schedule →</button>
+            </div>
+          </div>
+        )}
+
+        {tab === 'income' && (
+          <IncomeTab p={p} incomeList={incomeList} incomeCountLabel={incomeCountLabel} stmtList={stmtList}
+            incomeViewBtn={incomeViewBtn} editStatement={p.editStatement} />
+        )}
+
+        {tab === 'expenses' && (
+          <ExpensesTab p={p} period={period} periodLabelMap={periodLabelMap} expenseList={expenseList} />
+        )}
+
+        {tab === 'loan' && (
+          <LoanTab p={p} loan={loan} insCurrent={insCurrent} insuranceHistory={insuranceHistory} />
+        )}
+
+        {tab === 'tax' && (
+          <TaxTab p={p} tax={tax} taxViewBtn={taxViewBtn} />
+        )}
+
+      </div>
+    </div>
+  );
+}
+
+function FieldLabel({ children }) {
+  return <label style={{ fontSize: '11px', color: '#6b7280', fontWeight: 600 }}>{children}</label>;
+}
+const fieldInputStyle = { width: '100%', marginTop: '6px', background: '#f5f6f8', border: '1px solid #e2e5ea', color: '#14171f', padding: '10px', borderRadius: '8px', fontSize: '14px' };
+
+function IncomeTab({ p, incomeList, incomeCountLabel, stmtList, incomeViewBtn, editStatement }) {
+  const f = p.incomeForm;
+  const sf = p.statementForm;
+  return (
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px', gap: '12px', flexWrap: 'wrap' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '14px' }}>
+          <div style={{ display: 'flex', gap: '4px', background: '#ffffff', border: '1px solid #e6e8ec', borderRadius: '9px', padding: '3px' }}>
+            <button style={incomeViewBtn('shifts')} onClick={() => p.setIncomeView('shifts')}>Shifts</button>
+            <button style={incomeViewBtn('statements')} onClick={() => p.setIncomeView('statements')}>Monthly statements</button>
+          </div>
+          <div style={{ fontSize: '13px', color: '#6b7280' }}>{incomeCountLabel}</div>
+        </div>
+        {p.incomeView === 'shifts' && (
+          <button style={{ background: '#34d399', border: 'none', color: '#08120e', fontSize: '13px', fontWeight: 700, padding: '10px 16px', borderRadius: '10px', cursor: 'pointer' }}
+            onClick={() => p.setShowIncomeForm(!p.showIncomeForm)}>{p.showIncomeForm ? 'Cancel' : '+ Add income'}</button>
+        )}
+        {p.incomeView === 'statements' && (
+          <button style={{ background: '#34d399', border: 'none', color: '#08120e', fontSize: '13px', fontWeight: 700, padding: '10px 16px', borderRadius: '10px', cursor: 'pointer' }}
+            onClick={() => p.setShowStatementForm(!p.showStatementForm)}>{p.showStatementForm ? 'Cancel' : '+ Add statement'}</button>
+        )}
+      </div>
+
+      {p.incomeView === 'statements' && (
+        <div>
+          {p.showStatementForm && (
+            <div style={{ background: '#ffffff', border: '1px solid #e6e8ec', borderRadius: '16px', padding: '20px', marginBottom: '18px', animation: 'fadeUp 0.2s ease' }}>
+              <div style={{ fontSize: '13px', fontWeight: 700, marginBottom: '4px' }}>{p.editingStatementId ? 'Edit statement' : 'New monthly statement'}</div>
+              <div style={{ fontSize: '12px', color: '#8a90a0', marginBottom: '14px' }}>Copy the numbers from your platform's monthly tax summary.</div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(150px,1fr))', gap: '12px', marginBottom: '14px' }}>
+                <div>
+                  <FieldLabel>PLATFORM</FieldLabel>
+                  <select style={fieldInputStyle} value={sf.platform} onChange={e => p.setStatementForm({ ...sf, platform: e.target.value })}>
+                    {['Uber','Uber Eats','Lyft','Skip the Dishes','DoorDash','Instacart','Other'].map(o => <option key={o} value={o}>{o}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <FieldLabel>MONTH</FieldLabel>
+                  <input type="month" style={fieldInputStyle} value={sf.month} onChange={e => p.setStatementForm({ ...sf, month: e.target.value })} />
+                </div>
+              </div>
+              <div style={{ fontSize: '11px', color: '#6b7280', fontWeight: 600, textTransform: 'uppercase', margin: '6px 0 10px' }}>Income</div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(150px,1fr))', gap: '12px', marginBottom: '14px' }}>
+                <div><FieldLabel>GROSS FARES ($)</FieldLabel><input type="number" step="0.01" placeholder="0.00" style={fieldInputStyle} value={sf.grossFares} onChange={e => p.setStatementForm({ ...sf, grossFares: e.target.value })} /></div>
+                <div><FieldLabel>TIPS ($)</FieldLabel><input type="number" step="0.01" placeholder="0.00" style={fieldInputStyle} value={sf.tips} onChange={e => p.setStatementForm({ ...sf, tips: e.target.value })} /></div>
+                <div><FieldLabel>OTHER (PROMOS/REFERRALS) ($)</FieldLabel><input type="number" step="0.01" placeholder="0.00" style={fieldInputStyle} value={sf.otherIncome} onChange={e => p.setStatementForm({ ...sf, otherIncome: e.target.value })} /></div>
+                <div><FieldLabel>FEES PAID TO PLATFORM ($)</FieldLabel><input type="number" step="0.01" placeholder="0.00" style={fieldInputStyle} value={sf.fees} onChange={e => p.setStatementForm({ ...sf, fees: e.target.value })} /></div>
+              </div>
+              <div style={{ fontSize: '11px', color: '#6b7280', fontWeight: 600, textTransform: 'uppercase', margin: '6px 0 10px' }}>Sales tax (from statement)</div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(150px,1fr))', gap: '12px', marginBottom: '14px' }}>
+                <div><FieldLabel>GST COLLECTED ($)</FieldLabel><input type="number" step="0.01" placeholder="0.00" style={fieldInputStyle} value={sf.gstCollected} onChange={e => p.setStatementForm({ ...sf, gstCollected: e.target.value })} /></div>
+                <div><FieldLabel>QST COLLECTED ($)</FieldLabel><input type="number" step="0.01" placeholder="0.00" style={fieldInputStyle} value={sf.qstCollected} onChange={e => p.setStatementForm({ ...sf, qstCollected: e.target.value })} /></div>
+                <div><FieldLabel>GST REMITTED BY PLATFORM ($)</FieldLabel><input type="number" step="0.01" placeholder="0.00" style={fieldInputStyle} value={sf.gstRemitted} onChange={e => p.setStatementForm({ ...sf, gstRemitted: e.target.value })} /></div>
+                <div><FieldLabel>QST REMITTED BY PLATFORM ($)</FieldLabel><input type="number" step="0.01" placeholder="0.00" style={fieldInputStyle} value={sf.qstRemitted} onChange={e => p.setStatementForm({ ...sf, qstRemitted: e.target.value })} /></div>
+              </div>
+              <div style={{ fontSize: '11px', color: '#6b7280', fontWeight: 600, textTransform: 'uppercase', margin: '6px 0 10px' }}>Mileage</div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(150px,1fr))', gap: '12px', marginBottom: '16px' }}>
+                <div><FieldLabel>ON-TRIP KM</FieldLabel><input type="number" step="1" placeholder="0" style={fieldInputStyle} value={sf.kmOnTrip} onChange={e => p.setStatementForm({ ...sf, kmOnTrip: e.target.value })} /></div>
+                <div><FieldLabel>ONLINE KM</FieldLabel><input type="number" step="1" placeholder="0" style={fieldInputStyle} value={sf.kmOnline} onChange={e => p.setStatementForm({ ...sf, kmOnline: e.target.value })} /></div>
+              </div>
+              <button style={{ background: '#34d399', border: 'none', color: '#08120e', fontSize: '13px', fontWeight: 700, padding: '10px 18px', borderRadius: '8px', cursor: 'pointer' }} onClick={p.submitStatement}>{p.editingStatementId ? 'Save changes' : 'Save statement'}</button>
+            </div>
+          )}
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+            {stmtList.map(st => (
+              <div key={st.id} style={{ background: '#ffffff', border: '1px solid #e6e8ec', borderRadius: '16px', padding: '18px 20px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                    <span style={{ width: '10px', height: '10px', borderRadius: '50%', background: st.color, display: 'inline-block' }}></span>
+                    <div style={{ fontSize: '14px', fontWeight: 700 }}>{st.title}</div>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                    <button style={{ background: 'none', border: 'none', color: '#8a90a0', cursor: 'pointer', fontSize: '14px', padding: '4px' }} onClick={() => editStatement(st.raw)} title="Edit">✎</button>
+                    <button style={{ background: 'none', border: 'none', color: '#8a90a0', cursor: 'pointer', fontSize: '15px', padding: '4px' }} onClick={() => p.removeStatement(st.id)} title="Delete">✕</button>
+                  </div>
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(130px,1fr))', gap: '14px', marginTop: '14px' }}>
+                  <div><div style={{ fontSize: '11px', color: '#6b7280', fontWeight: 600, textTransform: 'uppercase' }}>Income</div><div style={{ fontFamily: "'Space Grotesk',sans-serif", fontWeight: 700, fontSize: '16px', color: '#059669', marginTop: '2px' }}>{st.incomeLabel}</div></div>
+                  <div><div style={{ fontSize: '11px', color: '#6b7280', fontWeight: 600, textTransform: 'uppercase' }}>Fees</div><div style={{ fontFamily: "'Space Grotesk',sans-serif", fontWeight: 700, fontSize: '16px', color: '#dc6547', marginTop: '2px' }}>{st.feesLabel}</div></div>
+                  <div><div style={{ fontSize: '11px', color: '#6b7280', fontWeight: 600, textTransform: 'uppercase' }}>Net</div><div style={{ fontFamily: "'Space Grotesk',sans-serif", fontWeight: 700, fontSize: '16px', marginTop: '2px' }}>{st.netLabel}</div></div>
+                  <div><div style={{ fontSize: '11px', color: '#6b7280', fontWeight: 600, textTransform: 'uppercase' }}>GST/QST owed</div><div style={{ fontFamily: "'Space Grotesk',sans-serif", fontWeight: 700, fontSize: '16px', color: '#0ea5e9', marginTop: '2px' }}>{st.gstNetLabel}</div></div>
+                </div>
+                {st.kmLabel && <div style={{ fontSize: '12px', color: '#8a90a0', marginTop: '10px' }}>{st.kmLabel}</div>}
+              </div>
+            ))}
+            {stmtList.length === 0 && <div style={{ fontSize: '13px', color: '#8a90a0', padding: '20px', background: '#ffffff', border: '1px solid #e6e8ec', borderRadius: '16px' }}>No statements yet — add your first monthly summary above.</div>}
+          </div>
+        </div>
+      )}
+
+      {p.incomeView === 'shifts' && (
+        <div>
+          {p.showIncomeForm && (
+            <div style={{ background: '#ffffff', border: '1px solid #e6e8ec', borderRadius: '16px', padding: '20px', marginBottom: '18px', animation: 'fadeUp 0.2s ease' }}>
+              <div style={{ fontSize: '13px', fontWeight: 700, marginBottom: '14px' }}>{p.editingIncomeId ? 'Edit shift' : 'New shift'}</div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(140px,1fr))', gap: '12px', marginBottom: '14px' }}>
+                <div>
+                  <FieldLabel>PLATFORM</FieldLabel>
+                  <select style={fieldInputStyle} value={f.platform} onChange={e => p.setIncomeForm({ ...f, platform: e.target.value })}>
+                    {['Uber','Uber Eats','Lyft','Skip the Dishes','DoorDash','Instacart','Other'].map(o => <option key={o} value={o}>{o}</option>)}
+                  </select>
+                </div>
+                <div><FieldLabel>DATE</FieldLabel><input type="date" style={fieldInputStyle} value={f.date} onChange={e => p.setIncomeForm({ ...f, date: e.target.value })} /></div>
+                <div><FieldLabel>HOURS</FieldLabel><input type="number" step="0.1" placeholder="0" style={fieldInputStyle} value={f.hours} onChange={e => p.setIncomeForm({ ...f, hours: e.target.value })} /></div>
+                <div><FieldLabel>AMOUNT ($)</FieldLabel><input type="number" step="0.01" placeholder="0.00" style={fieldInputStyle} value={f.amount} onChange={e => p.setIncomeForm({ ...f, amount: e.target.value })} /></div>
+              </div>
+              <button style={{ background: '#34d399', border: 'none', color: '#08120e', fontSize: '13px', fontWeight: 700, padding: '10px 18px', borderRadius: '8px', cursor: 'pointer' }} onClick={p.submitIncome}>{p.editingIncomeId ? 'Save changes' : 'Save shift'}</button>
+              {p.incomeFormError && <div style={{ fontSize: '12.5px', color: '#dc6547', fontWeight: 600, marginTop: '10px' }}>{p.incomeFormError}</div>}
+            </div>
+          )}
+
+          <div style={{ background: '#ffffff', border: '1px solid #e6e8ec', borderRadius: '16px', overflow: 'hidden' }}>
+            {incomeList.map(row => (
+              <div key={row.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '14px 20px', borderBottom: '1px solid #eef0f3' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                  <span style={{ width: '10px', height: '10px', borderRadius: '50%', background: row.color, display: 'inline-block' }}></span>
+                  <div>
+                    <div style={{ fontSize: '14px', fontWeight: 600 }}>{row.platform}</div>
+                    <div style={{ fontSize: '12px', color: '#6b7280' }}>{row.dateLabel}{row.hoursLabel}</div>
+                  </div>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '14px' }}>
+                  <div style={{ fontFamily: "'Space Grotesk',sans-serif", fontWeight: 700, fontSize: '15px', color: '#059669' }}>{row.amountLabel}</div>
+                  <button style={{ background: 'none', border: 'none', color: '#8a90a0', cursor: 'pointer', fontSize: '14px', padding: '4px' }} onClick={() => p.editIncome(row)} title="Edit">✎</button>
+                  <button style={{ background: 'none', border: 'none', color: '#8a90a0', cursor: 'pointer', fontSize: '15px', padding: '4px' }} onClick={() => p.removeIncome(row.id)} title="Delete">✕</button>
+                </div>
+              </div>
+            ))}
+            {incomeList.length === 0 && <div style={{ fontSize: '13px', color: '#8a90a0', padding: '20px' }}>No shifts yet — add your first one above.</div>}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ExpensesTab({ p, period, periodLabelMap, expenseList }) {
+  const f = p.expenseForm;
+  const isOther = f.category === 'Other';
+  return (
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+        <div style={{ fontSize: '13px', color: '#6b7280' }}>{periodLabelMap[period]} · {expenseList.length} entries</div>
+        <button style={{ background: '#dc6547', border: 'none', color: '#ffffff', fontSize: '13px', fontWeight: 700, padding: '10px 16px', borderRadius: '10px', cursor: 'pointer' }}
+          onClick={() => p.setShowExpenseForm(!p.showExpenseForm)}>{p.showExpenseForm ? 'Cancel' : '+ Add expense'}</button>
+      </div>
+
+      {p.showExpenseForm && (
+        <div style={{ background: '#ffffff', border: '1px solid #e6e8ec', borderRadius: '16px', padding: '20px', marginBottom: '18px', animation: 'fadeUp 0.2s ease' }}>
+          <div style={{ fontSize: '13px', fontWeight: 700, marginBottom: '14px' }}>{p.editingExpenseId ? 'Edit expense' : 'New expense'}</div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(140px,1fr))', gap: '12px', marginBottom: '14px' }}>
+            <div>
+              <FieldLabel>CATEGORY</FieldLabel>
+              <select style={fieldInputStyle} value={f.category} onChange={e => p.setExpenseForm({ ...f, category: e.target.value })}>
+                <option value="Gas">Gas</option>
+                <option value="Maintenance">Maintenance/repairs</option>
+                <option value="Phone Bill">Phone bill</option>
+                <option value="Car Wash">Car wash</option>
+                <option value="Parking/Tolls">Parking/tolls</option>
+                <option value="Other">Other</option>
+              </select>
+            </div>
+            {isOther && (
+              <div><FieldLabel>CATEGORY NAME</FieldLabel><input type="text" placeholder="e.g. Tolls app fee" style={fieldInputStyle} value={f.custom} onChange={e => p.setExpenseForm({ ...f, custom: e.target.value })} /></div>
+            )}
+            <div><FieldLabel>DATE</FieldLabel><input type="date" style={fieldInputStyle} value={f.date} onChange={e => p.setExpenseForm({ ...f, date: e.target.value })} /></div>
+            <div><FieldLabel>AMOUNT ($)</FieldLabel><input type="number" step="0.01" placeholder="0.00" style={fieldInputStyle} value={f.amount} onChange={e => p.setExpenseForm({ ...f, amount: e.target.value })} /></div>
+            <div><FieldLabel>NOTE</FieldLabel><input type="text" placeholder="optional" style={fieldInputStyle} value={f.note} onChange={e => p.setExpenseForm({ ...f, note: e.target.value })} /></div>
+          </div>
+          <button style={{ background: '#dc6547', border: 'none', color: '#ffffff', fontSize: '13px', fontWeight: 700, padding: '10px 18px', borderRadius: '8px', cursor: 'pointer' }} onClick={p.submitExpense}>{p.editingExpenseId ? 'Save changes' : 'Save expense'}</button>
+        </div>
+      )}
+
+      <div style={{ background: '#ffffff', border: '1px solid #e6e8ec', borderRadius: '16px', overflow: 'hidden' }}>
+        {expenseList.map(row => (
+          <div key={row.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '14px 20px', borderBottom: '1px solid #eef0f3' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+              <span style={{ width: '10px', height: '10px', borderRadius: '50%', background: row.color, display: 'inline-block' }}></span>
+              <div>
+                <div style={{ fontSize: '14px', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '8px' }}>{row.category}
+                  {row.auto && <span style={{ fontSize: '10px', fontWeight: 700, color: '#6b7280', background: '#f5f6f8', border: '1px solid #e2e5ea', padding: '2px 6px', borderRadius: '5px', letterSpacing: '0.4px' }}>AUTO</span>}
+                </div>
+                <div style={{ fontSize: '12px', color: '#6b7280' }}>{row.dateLabel}{row.noteLabel}</div>
+              </div>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+              <div style={{ fontFamily: "'Space Grotesk',sans-serif", fontWeight: 700, fontSize: '15px', color: '#dc6547' }}>{row.amountLabel}</div>
+              {row.removable && (
+                <React.Fragment>
+                  <button style={{ background: 'none', border: 'none', color: '#8a90a0', cursor: 'pointer', fontSize: '14px', padding: '4px' }} onClick={() => p.editExpense(row)} title="Edit">✎</button>
+                  <button style={{ background: 'none', border: 'none', color: '#8a90a0', cursor: 'pointer', fontSize: '15px', padding: '4px' }} onClick={() => p.removeExpense(row.id)} title="Delete">✕</button>
+                </React.Fragment>
+              )}
+            </div>
+          </div>
+        ))}
+        {expenseList.length === 0 && <div style={{ fontSize: '13px', color: '#8a90a0', padding: '20px' }}>No expenses yet — add your first one above.</div>}
+      </div>
+    </div>
+  );
+}
+
+function LoanTab({ p, loan, insCurrent, insuranceHistory }) {
+  const insf = p.insuranceForm;
+  return (
+    <div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(200px,1fr))', gap: '14px', marginBottom: '18px' }}>
+        <div style={{ background: '#ffffff', border: '1px solid #e6e8ec', borderRadius: '16px', padding: '18px' }}>
+          <div style={{ fontSize: '11px', color: '#6b7280', fontWeight: 600, textTransform: 'uppercase' }}>Principal</div>
+          <div style={{ fontFamily: "'Space Grotesk',sans-serif", fontSize: '22px', fontWeight: 700, marginTop: '6px' }}>{loan.principalLabel}</div>
+        </div>
+        <div style={{ background: '#ffffff', border: '1px solid #e6e8ec', borderRadius: '16px', padding: '18px' }}>
+          <div style={{ fontSize: '11px', color: '#6b7280', fontWeight: 600, textTransform: 'uppercase' }}>Interest rate</div>
+          <div style={{ fontFamily: "'Space Grotesk',sans-serif", fontSize: '22px', fontWeight: 700, marginTop: '6px' }}>8.99% APR</div>
+        </div>
+        <div style={{ background: '#ffffff', border: '1px solid #e6e8ec', borderRadius: '16px', padding: '18px' }}>
+          <div style={{ fontSize: '11px', color: '#6b7280', fontWeight: 600, textTransform: 'uppercase' }}>Weekly payment</div>
+          <div style={{ fontFamily: "'Space Grotesk',sans-serif", fontSize: '22px', fontWeight: 700, marginTop: '6px' }}>{loan.paymentLabel}</div>
+        </div>
+        <div style={{ background: '#ffffff', border: '1px solid #e6e8ec', borderRadius: '16px', padding: '18px' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '8px' }}>
+            <div style={{ fontSize: '11px', color: '#6b7280', fontWeight: 600, textTransform: 'uppercase' }}>Insurance / mo</div>
+            <button style={{ background: 'none', border: 'none', color: '#0ea5e9', cursor: 'pointer', fontSize: '12px', fontWeight: 600, padding: 0 }} onClick={() => p.setShowInsuranceForm(!p.showInsuranceForm)}>{p.showInsuranceForm ? 'Close' : 'Update'}</button>
+          </div>
+          <div style={{ fontFamily: "'Space Grotesk',sans-serif", fontSize: '22px', fontWeight: 700, marginTop: '6px' }}>{money(insCurrent.monthly)}</div>
+          <div style={{ fontSize: '11px', color: '#8a90a0', marginTop: '4px' }}>since {fmtDate(parseDate(insCurrent.start))}</div>
+        </div>
+      </div>
+
+      {p.showInsuranceForm && (
+        <div style={{ background: '#ffffff', border: '1px solid #e6e8ec', borderRadius: '16px', padding: '22px', marginBottom: '18px' }}>
+          <div style={{ fontFamily: "'Space Grotesk',sans-serif", fontWeight: 600, fontSize: '15px', marginBottom: '4px' }}>Update insurance premium</div>
+          <div style={{ fontSize: '12px', color: '#8a90a0', marginBottom: '14px' }}>Enter the new monthly amount from your renewal — months before the effective date keep the old rate.</div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(160px,1fr))', gap: '12px', alignItems: 'end' }}>
+            <div><FieldLabel>NEW MONTHLY AMOUNT ($)</FieldLabel><input type="number" step="0.01" placeholder="0.00" style={fieldInputStyle} value={insf.monthly} onChange={e => p.setInsuranceForm({ ...insf, monthly: e.target.value })} /></div>
+            <div><FieldLabel>EFFECTIVE FROM</FieldLabel><input type="date" style={fieldInputStyle} value={insf.start} onChange={e => p.setInsuranceForm({ ...insf, start: e.target.value })} /></div>
+            <button style={{ background: '#14171f', color: '#ffffff', border: 'none', borderRadius: '8px', padding: '11px 18px', fontSize: '13.5px', fontWeight: 600, cursor: 'pointer' }} onClick={p.submitInsuranceRate}>Save new rate</button>
+          </div>
+          <div style={{ marginTop: '16px', borderTop: '1px solid #eef0f3', paddingTop: '6px' }}>
+            <div style={{ fontSize: '11px', color: '#6b7280', fontWeight: 600, textTransform: 'uppercase', padding: '8px 0' }}>Rate history</div>
+            {insuranceHistory.map((h, i) => (
+              <div key={i} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '7px 0', fontSize: '13px', color: '#3a3f4b' }}>
+                <span>{h.rangeLabel}</span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                  <span style={{ fontWeight: 600 }}>{h.amountLabel}/mo</span>
+                  {h.removable && <button style={{ background: 'none', border: 'none', color: '#8a90a0', cursor: 'pointer', fontSize: '14px', padding: '2px' }} onClick={() => p.removeInsuranceRate(h.start)} title="Delete">✕</button>}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <div style={{ background: 'linear-gradient(135deg,#f7f8fa,#eef2f7)', border: '1px solid #e6e8ec', borderRadius: '16px', padding: '22px', marginBottom: '18px' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: '10px', marginBottom: '14px' }}>
+          <div style={{ fontFamily: "'Space Grotesk',sans-serif", fontWeight: 600, fontSize: '15px' }}>Payoff progress</div>
+          <div style={{ fontSize: '12px', color: '#6b7280' }}>Started {loan.startLabel} · est. payoff {loan.payoffLabel}</div>
+        </div>
+        <div style={{ height: '12px', background: '#f5f6f8', borderRadius: '7px', overflow: 'hidden', marginBottom: '12px' }}>
+          <div style={{ height: '100%', borderRadius: '7px', background: 'linear-gradient(90deg,#34d399,#0ea5e9)', width: loan.paidPct + '%' }}></div>
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '13px', flexWrap: 'wrap', gap: '8px' }}>
+          <span style={{ color: '#059669', fontWeight: 600 }}>{loan.paidSoFarLabel} paid ({loan.paidPctLabel}%)</span>
+          <span style={{ color: '#6b7280' }}>{loan.balanceLabel} remaining</span>
+          <span style={{ color: '#6b7280' }}>Next: {loan.nextPaymentLabel}</span>
+        </div>
+      </div>
+
+      <div style={{ background: '#ffffff', border: '1px solid #e6e8ec', borderRadius: '16px', overflow: 'hidden' }}>
+        <div style={{ padding: '16px 20px', borderBottom: '1px solid #eef0f3', fontFamily: "'Space Grotesk',sans-serif", fontWeight: 600, fontSize: '15px' }}>Amortization schedule</div>
+        {loan.years.map(yr => (
+          <div key={yr.year} style={{ borderBottom: '1px solid #eef0f3' }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '14px 20px', cursor: 'pointer' }} onClick={yr.toggle}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                <span style={{ fontSize: '13px', color: '#6b7280', transform: yr.arrowRotate, transition: 'transform 0.15s', display: 'inline-block' }}>▶</span>
+                <span style={{ fontWeight: 600, fontSize: '14px' }}>{yr.year}</span>
+                <span style={{ fontSize: '12px', color: '#8a90a0' }}>{yr.countLabel}</span>
+              </div>
+              <div style={{ display: 'flex', gap: '20px', fontSize: '12px', color: '#6b7280' }}>
+                <span>Principal {yr.principalLabel}</span>
+                <span>Interest {yr.interestLabel}</span>
+              </div>
+            </div>
+            {yr.expanded && (
+              <div style={{ maxHeight: '340px', overflowY: 'auto', padding: '0 20px 12px' }}>
+                <div style={{ display: 'grid', gridTemplateColumns: '0.7fr 1fr 1fr 1fr 1fr', gap: '8px', fontSize: '11px', color: '#8a90a0', fontWeight: 600, padding: '8px 0', position: 'sticky', top: 0, background: '#ffffff' }}>
+                  <span>#</span><span>Date</span><span>Principal</span><span>Interest</span><span>Balance</span>
+                </div>
+                {yr.rows.map(r => (
+                  <div key={r.n} style={{ display: 'grid', gridTemplateColumns: '0.7fr 1fr 1fr 1fr 1fr', gap: '8px', fontSize: '12.5px', padding: '6px 0', color: '#3a3f4b' }}>
+                    <span style={{ color: '#8a90a0' }}>{r.n}</span><span>{r.dateLabel}</span><span>{r.principalLabel}</span><span>{r.interestLabel}</span><span>{r.balanceLabel}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function TaxTab({ p, tax, taxViewBtn }) {
+  return (
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px', marginBottom: '18px' }}>
+        <div style={{ fontSize: '13px', color: '#6b7280' }}>{tax.yearLabel} · income tax + CPP/QPP estimate</div>
+        <div style={{ display: 'flex', background: '#ffffff', border: '1px solid #e6e8ec', borderRadius: '10px', padding: '3px' }}>
+          <button style={taxViewBtn('ytd')} onClick={() => p.setTaxView('ytd')}>Year-to-date</button>
+          <button style={taxViewBtn('projected')} onClick={() => p.setTaxView('projected')}>Projected full year</button>
+        </div>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(220px,1fr))', gap: '14px', marginBottom: '18px' }}>
+        <div style={{ background: '#ffffff', border: '1px solid #e6e8ec', borderRadius: '16px', padding: '20px' }}>
+          <div style={{ fontSize: '12px', color: '#6b7280', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.5px' }}>Net self-employment income</div>
+          <div style={{ fontFamily: "'Space Grotesk',sans-serif", fontSize: '26px', fontWeight: 700, marginTop: '8px' }}>{tax.netIncomeLabel}</div>
+          <div style={{ fontSize: '12px', color: '#8a90a0', marginTop: '6px' }}>income minus deductible expenses</div>
+        </div>
+        <div style={{ background: '#ffffff', border: '1px solid #e6e8ec', borderRadius: '16px', padding: '20px' }}>
+          <div style={{ fontSize: '12px', color: '#6b7280', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.5px' }}>Estimated tax owed</div>
+          <div style={{ fontFamily: "'Space Grotesk',sans-serif", fontSize: '26px', fontWeight: 700, marginTop: '8px', color: '#dc6547' }}>{tax.totalTaxLabel}</div>
+          <div style={{ fontSize: '12px', color: '#8a90a0', marginTop: '6px' }}>CRA + Revenu Québec + CPP/QPP</div>
+        </div>
+        <div style={{ background: '#ffffff', border: '1px solid #e6e8ec', borderRadius: '16px', padding: '20px' }}>
+          <div style={{ fontSize: '12px', color: '#6b7280', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.5px' }}>Suggested weekly set-aside</div>
+          <div style={{ fontFamily: "'Space Grotesk',sans-serif", fontSize: '26px', fontWeight: 700, marginTop: '8px', color: '#059669' }}>{tax.weeklySetAsideLabel}</div>
+          <div style={{ fontSize: '12px', color: '#8a90a0', marginTop: '6px' }}>{tax.effectiveRateLabel} effective rate</div>
+        </div>
+      </div>
+
+      <div style={{ background: '#ffffff', border: '1px solid #e6e8ec', borderRadius: '16px', padding: '22px', marginBottom: '18px' }}>
+        <div style={{ fontFamily: "'Space Grotesk',sans-serif", fontWeight: 600, fontSize: '15px', marginBottom: '16px' }}>What you owe, by agency</div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '12px 0', borderBottom: '1px solid #eef0f3' }}>
+          <div><div style={{ fontSize: '14px', fontWeight: 600 }}>CRA — federal income tax</div><div style={{ fontSize: '12px', color: '#8a90a0' }}>after 16.5% Québec abatement</div></div>
+          <div style={{ fontFamily: "'Space Grotesk',sans-serif", fontWeight: 700, fontSize: '16px' }}>{tax.federalLabel}</div>
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '12px 0', borderBottom: '1px solid #eef0f3' }}>
+          <div><div style={{ fontSize: '14px', fontWeight: 600 }}>Revenu Québec — provincial income tax</div><div style={{ fontSize: '12px', color: '#8a90a0' }}>filed separately from your federal return</div></div>
+          <div style={{ fontFamily: "'Space Grotesk',sans-serif", fontWeight: 700, fontSize: '16px' }}>{tax.quebecLabel}</div>
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '12px 0', borderBottom: '1px solid #eef0f3' }}>
+          <div><div style={{ fontSize: '14px', fontWeight: 600 }}>QPP — self-employed contribution</div><div style={{ fontSize: '12px', color: '#8a90a0' }}>you pay both the employee and employer share</div></div>
+          <div style={{ fontFamily: "'Space Grotesk',sans-serif", fontWeight: 700, fontSize: '16px' }}>{tax.qppLabel}</div>
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '14px 0 0' }}>
+          <div style={{ fontSize: '14px', fontWeight: 700 }}>Total estimated tax</div>
+          <div style={{ fontFamily: "'Space Grotesk',sans-serif", fontWeight: 700, fontSize: '18px', color: '#dc6547' }}>{tax.totalTaxLabel}</div>
+        </div>
+      </div>
+
+      <div style={{ background: '#ffffff', border: '1px solid #e6e8ec', borderRadius: '16px', padding: '22px', marginBottom: '18px' }}>
+        <div style={{ fontFamily: "'Space Grotesk',sans-serif", fontWeight: 600, fontSize: '15px', marginBottom: '4px' }}>GST/QST on rideshare fares</div>
+        <div style={{ fontSize: '12px', color: '#8a90a0', marginBottom: '14px' }}>Uber + Lyft income, year-to-date — sales tax is included in your fares and must be remitted</div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', padding: '8px 0', fontSize: '13px', color: '#3a3f4b', borderBottom: '1px solid #eef0f3' }}><span>Rideshare gross fares</span><span style={{ fontWeight: 600 }}>{tax.gst.grossLabel}</span></div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', padding: '8px 0', fontSize: '13px', color: '#3a3f4b', borderBottom: '1px solid #eef0f3' }}><span>GST to remit (5%)</span><span style={{ fontWeight: 600 }}>{tax.gst.gstLabel}</span></div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', padding: '8px 0', fontSize: '13px', color: '#3a3f4b', borderBottom: '1px solid #eef0f3' }}><span>QST to remit (9.975%)</span><span style={{ fontWeight: 600 }}>{tax.gst.qstLabel}</span></div>
+        {tax.gst.hasStatements && (
+          <div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', padding: '8px 0', fontSize: '13px', color: '#3a3f4b', borderBottom: '1px solid #eef0f3' }}><span>GST/QST collected (statements)</span><span style={{ fontWeight: 600 }}>{tax.gst.stCollectedLabel}</span></div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', padding: '8px 0', fontSize: '13px', color: '#3a3f4b', borderBottom: '1px solid #eef0f3' }}><span>Already remitted by platform</span><span style={{ fontWeight: 600, color: '#059669' }}>{tax.gst.stRemittedLabel}</span></div>
+          </div>
+        )}
+        <div style={{ display: 'flex', justifyContent: 'space-between', padding: '10px 0 0', fontSize: '13px', fontWeight: 700 }}><span>Total to remit</span><span style={{ color: '#dc6547' }}>{tax.gst.totalLabel}</span></div>
+        <div style={{ fontSize: '11.5px', color: '#8a90a0', marginTop: '10px' }}>Rideshare drivers must register for GST/QST from the first dollar. Delivery-only income (Skip, DoorDash, Instacart) is exempt below $30,000/year. Input tax credits on expenses can reduce what you remit.</div>
+      </div>
+
+      <div style={{ background: '#ffffff', border: '1px solid #e6e8ec', borderRadius: '16px', padding: '22px', marginBottom: '18px' }}>
+        <div style={{ fontFamily: "'Space Grotesk',sans-serif", fontWeight: 600, fontSize: '15px', marginBottom: '14px' }}>Deductible business expenses counted</div>
+        {tax.deductions.map((d, i) => (
+          <div key={i} style={{ display: 'flex', justifyContent: 'space-between', padding: '8px 0', fontSize: '13px', color: '#3a3f4b' }}><span>{d.name}</span><span style={{ fontWeight: 600 }}>{d.amountLabel}</span></div>
+        ))}
+        <div style={{ display: 'flex', justifyContent: 'space-between', padding: '10px 0 0', marginTop: '6px', borderTop: '1px solid #eef0f3', fontSize: '13px', fontWeight: 700 }}><span>Total deductions</span><span>{tax.totalDeductionsLabel}</span></div>
+        <div style={{ fontSize: '11.5px', color: '#8a90a0', marginTop: '10px' }}>Only the interest portion of your car loan payment is deductible — not the principal.</div>
+      </div>
+
+      <div style={{ background: '#f7f8fa', border: '1px solid #e6e8ec', borderRadius: '16px', padding: '18px 20px', fontSize: '12.5px', color: '#6b7280', lineHeight: 1.6 }}>
+        Estimates use approximate 2026 federal and Québec tax brackets, the federal/Québec basic personal amounts, and self-employed QPP rates — actual amounts depend on your full tax return, credits, and other income. Ride-share drivers (Uber, Lyft) must also register for and collect GST/QST from their first dollar of fares, separate from income tax — check Revenu Québec's rules for platform drivers. Consult a tax professional for exact figures.
+      </div>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App />);
+</script>
+<script>
+  // Manually transform the JSX source with the classic runtime (React.createElement),
+  // since the automatic runtime would emit `import` statements babel-standalone's
+  // autorun can't execute in a plain (non-module) inline script.
+  var source = document.getElementById('app-source').textContent;
+  var output = Babel.transform(source, { presets: [['react', { runtime: 'classic' }]] }).code;
+  var script = document.createElement('script');
+  script.textContent = output;
+  document.body.appendChild(script);
+</script>
+</body>
+</html>
