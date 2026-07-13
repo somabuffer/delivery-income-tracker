@@ -36,45 +36,56 @@ app.get('/api/auth/me', requireAuth, (req, res) => {
 
 // ---------- Data ----------
 
-app.get('/api/data', requireAuth, (req, res) => {
-  res.json(store.readData());
-});
+// Wraps an async route handler so a rejected promise (e.g. a Redis network
+// error) becomes a 500 instead of crashing the process / hanging the request.
+function asyncRoute(fn) {
+  return (req, res) => {
+    Promise.resolve(fn(req, res)).catch(e => {
+      console.error(e);
+      if (!res.headersSent) res.status(500).json({ error: 'Storage error' });
+    });
+  };
+}
+
+app.get('/api/data', requireAuth, asyncRoute(async (req, res) => {
+  res.json(await store.readData());
+}));
 
 function crudRoutes(name, collection) {
-  app.post(`/api/${name}`, requireAuth, (req, res) => {
-    const row = store.addRow(collection, req.body);
+  app.post(`/api/${name}`, requireAuth, asyncRoute(async (req, res) => {
+    const row = await store.addRow(collection, req.body);
     res.status(201).json(row);
-  });
-  app.put(`/api/${name}/:id`, requireAuth, (req, res) => {
-    const row = store.updateRow(collection, req.params.id, req.body);
+  }));
+  app.put(`/api/${name}/:id`, requireAuth, asyncRoute(async (req, res) => {
+    const row = await store.updateRow(collection, req.params.id, req.body);
     if (!row) return res.status(404).json({ error: 'Not found' });
     res.json(row);
-  });
-  app.delete(`/api/${name}/:id`, requireAuth, (req, res) => {
-    const ok = store.deleteRow(collection, req.params.id);
+  }));
+  app.delete(`/api/${name}/:id`, requireAuth, asyncRoute(async (req, res) => {
+    const ok = await store.deleteRow(collection, req.params.id);
     if (!ok) return res.status(404).json({ error: 'Not found' });
     res.status(204).end();
-  });
+  }));
 }
 
 crudRoutes('income', 'income');
 crudRoutes('expenses', 'expenses');
 crudRoutes('statements', 'statements');
 
-app.post('/api/insurance-rates', requireAuth, (req, res) => {
+app.post('/api/insurance-rates', requireAuth, asyncRoute(async (req, res) => {
   const { start, monthly } = req.body;
   if (!start || !monthly || monthly <= 0) {
     return res.status(400).json({ error: 'start and a positive monthly amount are required' });
   }
-  const rates = store.upsertInsuranceRate({ start, monthly });
+  const rates = await store.upsertInsuranceRate({ start, monthly });
   res.status(201).json(rates);
-});
+}));
 
-app.delete('/api/insurance-rates/:start', requireAuth, (req, res) => {
-  const ok = store.deleteInsuranceRate(req.params.start);
+app.delete('/api/insurance-rates/:start', requireAuth, asyncRoute(async (req, res) => {
+  const ok = await store.deleteInsuranceRate(req.params.start);
   if (!ok) return res.status(404).json({ error: 'Not found, or the only remaining rate' });
   res.status(204).end();
-});
+}));
 
 // ---------- Static frontend ----------
 
