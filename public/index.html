@@ -26,9 +26,9 @@ const { useState, useEffect, useRef } = React;
 
 const PLATFORM_COLORS = {
   'Uber': '#06C167', 'Uber Eats': '#05a356', 'Lyft': '#EA0B8C', 'Skip the Dishes': '#FF8000',
-  'DoorDash': '#EF4444', 'Instacart': '#43B02A', 'Spotify': '#1DB954', 'Other': '#8b93a3'
+  'DoorDash': '#EF4444', 'Instacart': '#43B02A', 'Other': '#8b93a3'
 };
-const PLATFORM_OPTIONS = ['Uber', 'Uber Eats', 'Lyft', 'Skip the Dishes', 'DoorDash', 'Instacart', 'Spotify', 'Other'];
+const PLATFORM_OPTIONS = ['Uber', 'Uber Eats', 'Lyft', 'Skip the Dishes', 'DoorDash', 'Instacart', 'Other'];
 const CATEGORY_COLORS = {
   'Gas': '#f2b26b', 'Maintenance': '#e06b8b', 'Phone Bill': '#6ba7f2', 'Car Wash': '#6bd0f2',
   'Parking/Tolls': '#c39bf0', 'Car Loan': '#34d399', 'Insurance': '#0ea5e9', 'Platform Fees': '#f0b429',
@@ -169,6 +169,14 @@ function getRecurringExpenses(schedule, upTo, insuranceRates) {
       out.push({ id: 'loan-' + r.n, date: localISO(r.date), category: 'Car Loan', amount: r.payment, note: 'Weekly payment', auto: true, removable: false });
     }
   });
+  const SUB = { name: 'Spotify', amount: 22.98, day: 12 };
+  let sd = new Date(upTo.getFullYear(), 0, SUB.day);
+  let sGuard = 0;
+  while (sd <= upTo && sGuard < 24) {
+    out.push({ id: 'sub-spotify-' + sd.getFullYear() + '-' + sd.getMonth(), date: localISO(sd), category: 'Subscriptions', amount: SUB.amount, note: SUB.name + ' — monthly', auto: true, removable: false });
+    sd = new Date(sd.getFullYear(), sd.getMonth() + 1, SUB.day);
+    sGuard++;
+  }
   const insRates = getInsuranceRates(insuranceRates);
   if (insRates.length) {
     const firstStart = parseDate(insRates[0].start);
@@ -551,10 +559,8 @@ function Dashboard(p) {
 
   const allExpenses = [...expenses, ...recurring, ...stmtFeeExpenses];
 
-  const spotifyOk = (platform, dateStr) => platform !== 'Spotify' || inPeriod(dateStr, 'month', today);
-
-  const periodIncome = income.filter(r => inPeriod(r.date, period, today, customStart, customEnd) && spotifyOk(r.platform, r.date));
-  const periodStatements = statements.filter(s => inPeriod(localISO(stmtDate(s)), period, today, customStart, customEnd) && spotifyOk(s.platform, localISO(stmtDate(s))));
+  const periodIncome = income.filter(r => inPeriod(r.date, period, today, customStart, customEnd));
+  const periodStatements = statements.filter(s => inPeriod(localISO(stmtDate(s)), period, today, customStart, customEnd));
   const periodExpenses = allExpenses.filter(r => inPeriod(r.date, period, today, customStart, customEnd));
 
   const gross = periodIncome.reduce((s,r) => s + r.amount, 0) + periodStatements.reduce((s,r) => s + stmtIncome(r), 0);
@@ -696,7 +702,7 @@ function Dashboard(p) {
     ...Object.keys(manualByCat).map(cat => ({ name: catLabels[cat] || cat, amountLabel: money(manualByCat[cat]) })),
     ...(ytdStmtFees > 0 ? [{ name: 'Platform fees (statements)', amountLabel: money(ytdStmtFees) }] : []),
     ...(ytdInsurance > 0 ? [{ name: 'Insurance', amountLabel: money(ytdInsurance) }] : []),
-    ...(ytdSubscriptions > 0 ? [{ name: 'Subscriptions (Shopify)', amountLabel: money(ytdSubscriptions) }] : []),
+    ...(ytdSubscriptions > 0 ? [{ name: 'Subscriptions (Spotify)', amountLabel: money(ytdSubscriptions) }] : []),
     ...(ytdLoanInterest > 0 ? [{ name: 'Car loan interest', amountLabel: money(ytdLoanInterest) }] : [])
   ];
 
