@@ -169,14 +169,6 @@ function getRecurringExpenses(schedule, upTo, insuranceRates) {
       out.push({ id: 'loan-' + r.n, date: localISO(r.date), category: 'Car Loan', amount: r.payment, note: 'Weekly payment', auto: true, removable: false });
     }
   });
-  const SUB = { name: 'Shopify', amount: 22.98, day: 12 };
-  let sd = new Date(upTo.getFullYear(), 0, SUB.day);
-  let sGuard = 0;
-  while (sd <= upTo && sGuard < 24) {
-    out.push({ id: 'sub-shopify-' + sd.getFullYear() + '-' + sd.getMonth(), date: localISO(sd), category: 'Subscriptions', amount: SUB.amount, note: SUB.name + ' — monthly', auto: true, removable: false });
-    sd = new Date(sd.getFullYear(), sd.getMonth() + 1, SUB.day);
-    sGuard++;
-  }
   const insRates = getInsuranceRates(insuranceRates);
   if (insRates.length) {
     const firstStart = parseDate(insRates[0].start);
