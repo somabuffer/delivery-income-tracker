@@ -1,23 +1,34 @@
 require('dotenv').config();
 const path = require('path');
 const express = require('express');
-const { clerkMiddleware, requireAuth, PUBLISHABLE_KEY } = require('./lib/auth');
+const { clerkMiddleware, requireAuth, PUBLISHABLE_KEY, SECRET_KEY } = require('./lib/auth');
 const store = require('./lib/store');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
-app.use(clerkMiddleware());
 
 // ---------- Auth ----------
-// Clerk handles sign-in/sign-up/sign-out entirely client-side. Every API request
-// below carries a Clerk session token as a Bearer header, which clerkMiddleware()
-// decodes and requireAuth then checks against ALLOWED_EMAIL — no server-side session state.
+// Clerk handles sign-in/sign-up/sign-out entirely client-side. Every authed API
+// request below carries a Clerk session token as a Bearer header, which
+// clerkMiddleware() decodes and requireAuth then checks against ALLOWED_EMAIL —
+// no server-side session state.
 
+// Public: the frontend calls this to learn whether Clerk is set up. It must stay
+// outside clerkMiddleware(), which throws when the keys are missing — otherwise a
+// misconfigured deploy 500s here and the frontend can't even show its "not
+// configured" message.
 app.get('/api/auth/config', (req, res) => {
   res.json({ publishableKey: PUBLISHABLE_KEY || null });
 });
+
+// Only mount clerkMiddleware() when both keys are present. Registering it without
+// keys makes it throw on every request (a hard 500 for the whole site, static
+// frontend included). When it's absent, requireAuth falls through to a clean 401.
+if (PUBLISHABLE_KEY && SECRET_KEY) {
+  app.use('/api', clerkMiddleware());
+}
 
 app.get('/api/auth/me', requireAuth, (req, res) => {
   res.json({ authenticated: true, email: req.userEmail });
