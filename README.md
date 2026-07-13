@@ -10,10 +10,10 @@ access it.
 2. Go to **APIs & Services > OAuth consent screen** and configure it (External is fine; you don't need to publish it — just add your own Gmail address as a test user).
 3. Go to **APIs & Services > Credentials > Create Credentials > OAuth client ID**.
    - Application type: **Web application**
-   - Authorized JavaScript origins: `http://localhost:3000` (or whatever port you use)
+   - Authorized JavaScript origins: add `http://localhost:3000` for local dev, and your deployed URL (e.g. `https://your-app.onrender.com`) once you have one — see below.
 4. Copy the generated **Client ID**.
 
-## 2. Configure the server
+## 2. Run locally
 
 ```bash
 cp .env.example .env
@@ -27,8 +27,6 @@ Edit `.env`:
   node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
   ```
 
-## 3. Install and run
-
 ```bash
 npm install
 npm start
@@ -36,10 +34,29 @@ npm start
 
 Open `http://localhost:3000`, sign in with your Google account, and start tracking.
 
+## 3. Deploy (Render)
+
+This app is a regular always-on Node/Express server with data written to a local file, so it
+needs a host with a persistent disk — **not** a serverless platform like Vercel (those have
+read-only, ephemeral filesystems, so writes to `data.json` would silently disappear).
+
+1. Push this repo to GitHub (already done if you're reading this from the repo).
+2. In the [Render dashboard](https://dashboard.render.com/), click **New > Blueprint**, and point it at this repo. Render will read `render.yaml` and set up:
+   - A web service running `npm install` / `npm start`
+   - A 1GB persistent disk mounted at `/data`, with `DATA_DIR=/data` so `data.json` survives deploys and restarts
+3. Render will prompt you for the env vars marked `sync: false` in `render.yaml`:
+   - `GOOGLE_CLIENT_ID`
+   - `ALLOWED_EMAIL`
+   - (`SESSION_SECRET` is generated for you automatically)
+4. **Note:** a persistent disk requires Render's Starter plan or higher (not the free tier) — see [Render's pricing](https://render.com/pricing).
+5. Once deployed, copy the `https://your-app.onrender.com` URL Render gives you and add it as an **Authorized JavaScript origin** on your Google OAuth Client ID (step 1 above) — Google Sign-In will fail until you do this.
+
 ## Data storage
 
-All income, expenses, monthly statements, and insurance rates are stored in `data/data.json`
-on disk (created automatically on first run). Back this file up if you want — it's plain JSON.
+All income, expenses, monthly statements, and insurance rates are stored in a `data.json` file
+on disk (created automatically on first run) — at `./data/data.json` locally, or wherever
+`DATA_DIR` points (e.g. `/data` on Render's persistent disk). Back this file up if you want —
+it's plain JSON.
 
 ## Project structure
 
