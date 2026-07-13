@@ -16,7 +16,6 @@
 <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-<script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
 <body>
 <div id="root"></div>
@@ -191,12 +190,11 @@ const toCss = (o) => Object.entries(o).map(([k,v]) => k.replace(/[A-Z]/g, m => '
 // ---------- API helpers ----------
 
 async function api(path, opts) {
-  const res = await fetch('/api' + path, {
-    headers: { 'Content-Type': 'application/json' },
-    credentials: 'same-origin',
-    ...opts
-  });
-  if (res.status === 401) { const err = new Error('Not authenticated'); err.authError = true; throw err; }
+  const token = (window.Clerk && window.Clerk.session) ? await window.Clerk.session.getToken() : null;
+  const headers = { 'Content-Type': 'application/json' };
+  if (token) headers['Authorization'] = 'Bearer ' + token;
+  const res = await fetch('/api' + path, { headers, ...opts });
+  if (res.status === 401 || res.status === 403) { const err = new Error('Not authenticated'); err.authError = true; throw err; }
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
     throw new Error(body.error || ('Request failed (' + res.status + ')'));
@@ -205,48 +203,63 @@ async function api(path, opts) {
   return res.json();
 }
 
-// ---------- Login screen ----------
+// Clerk's publishable key base64-encodes the Frontend API host (with a trailing "$").
+// This is the documented technique for loading Clerk's JS in a plain script-tag setup
+// (no npm/bundler) — see Clerk's "vanilla JS" quickstart.
+function frontendApiFromPublishableKey(pk) {
+  const stripped = pk.replace(/^pk_(test|live)_/, '').replace(/-/g, '+').replace(/_/g, '/');
+  return atob(stripped).replace(/\$$/, '');
+}
 
-function LoginScreen({ clientId, onSignedIn, authError }) {
-  const btnRef = useRef(null);
+function loadClerkScript(publishableKey) {
+  return new Promise((resolve, reject) => {
+    if (window.Clerk) { resolve(); return; }
+    const script = document.createElement('script');
+    script.async = true;
+    script.crossOrigin = 'anonymous';
+    script.setAttribute('data-clerk-publishable-key', publishableKey);
+    script.src = 'https://' + frontendApiFromPublishableKey(publishableKey) + '/npm/@clerk/clerk-js@5/dist/clerk.browser.js';
+    script.addEventListener('load', () => resolve());
+    script.addEventListener('error', () => reject(new Error('Failed to load Clerk')));
+    document.head.appendChild(script);
+  });
+}
+
+// ---------- Login / authorization screens ----------
+
+function LoginScreen({ clerkReady, configError }) {
+  const containerRef = useRef(null);
 
   useEffect(() => {
-    if (!clientId) return;
-    function init() {
-      if (!window.google || !window.google.accounts || !window.google.accounts.id) {
-        setTimeout(init, 100);
-        return;
-      }
-      window.google.accounts.id.initialize({
-        client_id: clientId,
-        callback: async (response) => {
-          try {
-            const result = await api('/auth/google', { method: 'POST', body: JSON.stringify({ credential: response.credential }) });
-            onSignedIn(result.email);
-          } catch (e) {
-            onSignedIn(null, e.message);
-          }
-        }
-      });
-      if (btnRef.current) {
-        window.google.accounts.id.renderButton(btnRef.current, { theme: 'outline', size: 'large', width: 280 });
-      }
+    if (clerkReady && window.Clerk && containerRef.current) {
+      window.Clerk.mountSignIn(containerRef.current);
+      return () => window.Clerk.unmountSignIn(containerRef.current);
     }
-    init();
-  }, [clientId]);
+  }, [clerkReady]);
 
   return (
     <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#faf9f5' }}>
-      <div style={{ background: '#ffffff', border: '1px solid #e6e8ec', borderRadius: '20px', padding: '40px', width: '340px', textAlign: 'center' }}>
+      <div style={{ background: '#ffffff', border: '1px solid #e6e8ec', borderRadius: '20px', padding: '32px', textAlign: 'center' }}>
         <div style={{ width: '48px', height: '48px', borderRadius: '12px', background: 'linear-gradient(135deg,#34d399,#0ea5e9)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: "'Space Grotesk',sans-serif", fontWeight: 700, color: '#08120e', fontSize: '20px', margin: '0 auto 18px' }}>D</div>
         <div style={{ fontFamily: "'Space Grotesk',sans-serif", fontWeight: 700, fontSize: '20px', marginBottom: '6px' }}>DriveLedger</div>
-        <div style={{ fontSize: '13px', color: '#6b7280', marginBottom: '26px' }}>Sign in with your Google account to access your income &amp; expense data.</div>
-        {clientId ? (
-          <div ref={btnRef} style={{ display: 'flex', justifyContent: 'center' }} />
+        <div style={{ fontSize: '13px', color: '#6b7280', marginBottom: '22px' }}>Sign in to access your income &amp; expense data.</div>
+        {configError ? (
+          <div style={{ fontSize: '12.5px', color: '#dc6547' }}>{configError}</div>
         ) : (
-          <div style={{ fontSize: '12.5px', color: '#dc6547' }}>Server isn't configured with a Google Client ID yet — set GOOGLE_CLIENT_ID in .env.</div>
+          <div ref={containerRef} style={{ minWidth: '300px' }} />
         )}
-        {authError && <div style={{ fontSize: '12.5px', color: '#dc6547', marginTop: '16px' }}>{authError}</div>}
+      </div>
+    </div>
+  );
+}
+
+function NotAuthorizedScreen({ email, onSignOut }) {
+  return (
+    <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#faf9f5' }}>
+      <div style={{ background: '#ffffff', border: '1px solid #e6e8ec', borderRadius: '20px', padding: '40px', width: '340px', textAlign: 'center' }}>
+        <div style={{ fontFamily: "'Space Grotesk',sans-serif", fontWeight: 700, fontSize: '18px', marginBottom: '10px' }}>Not authorized</div>
+        <div style={{ fontSize: '13px', color: '#6b7280', marginBottom: '22px' }}>{email ? (email + ' isn’t') : 'This account isn’t'} allowed to access this app.</div>
+        <button onClick={onSignOut} style={{ background: '#14171f', color: '#ffffff', border: 'none', borderRadius: '8px', padding: '10px 18px', fontSize: '13px', fontWeight: 600, cursor: 'pointer' }}>Sign out and try another account</button>
       </div>
     </div>
   );
@@ -255,10 +268,11 @@ function LoginScreen({ clientId, onSignedIn, authError }) {
 // ---------- Main App ----------
 
 function App() {
-  const [authState, setAuthState] = useState('checking'); // checking | signed-out | signed-in
-  const [authError, setAuthError] = useState('');
+  const [authState, setAuthState] = useState('checking'); // checking | signed-out | not-authorized | signed-in
+  const [configError, setConfigError] = useState('');
+  const [clerkReady, setClerkReady] = useState(false);
   const [userEmail, setUserEmail] = useState(null);
-  const [clientId, setClientId] = useState(null);
+  const [attemptedEmail, setAttemptedEmail] = useState(null);
 
   const [income, setIncome] = useState(null);
   const [expenses, setExpenses] = useState(null);
@@ -289,44 +303,48 @@ function App() {
   const [showInsuranceForm, setShowInsuranceForm] = useState(false);
   const [insuranceForm, setInsuranceForm] = useState({ monthly: '', start: todayStr() });
 
-  useEffect(() => { checkAuth(); }, []);
+  useEffect(() => { initClerk(); }, []);
 
-  async function checkAuth() {
+  async function initClerk() {
     try {
       const cfg = await fetch('/api/auth/config').then(r => r.json());
-      setClientId(cfg.clientId);
-      const me = await fetch('/api/auth/me').then(r => r.json());
-      if (me.authenticated) {
-        setUserEmail(me.email);
-        setAuthState('signed-in');
-        loadData();
-      } else {
+      if (!cfg.publishableKey) {
+        setConfigError("Server isn't configured with a Clerk publishable key yet — set CLERK_PUBLISHABLE_KEY in .env.");
         setAuthState('signed-out');
+        return;
       }
+      await loadClerkScript(cfg.publishableKey);
+      await window.Clerk.load();
+      setClerkReady(true);
+      window.Clerk.addListener(({ user }) => handleClerkUserChange(user));
+      handleClerkUserChange(window.Clerk.user);
     } catch (e) {
+      setConfigError(e.message || 'Failed to load sign-in');
       setAuthState('signed-out');
     }
   }
 
-  function handleSignedIn(email, error) {
-    if (email) {
-      setUserEmail(email);
+  async function handleClerkUserChange(user) {
+    if (!user) {
+      setUserEmail(null);
+      setAuthState('signed-out');
+      setIncome(null); setExpenses(null); setStatements(null); setInsuranceRates(null);
+      return;
+    }
+    try {
+      const me = await api('/auth/me');
+      setUserEmail(me.email);
       setAuthState('signed-in');
-      setAuthError('');
       loadData();
-    } else {
-      setAuthError(error || 'Sign-in failed');
+    } catch (e) {
+      const primary = user.primaryEmailAddress ? user.primaryEmailAddress.emailAddress : null;
+      setAttemptedEmail(primary);
+      setAuthState('not-authorized');
     }
   }
 
   async function handleLogout() {
-    await api('/auth/logout', { method: 'POST' }).catch(() => {});
-    if (window.google && window.google.accounts && window.google.accounts.id) {
-      window.google.accounts.id.disableAutoSelect();
-    }
-    setUserEmail(null);
-    setAuthState('signed-out');
-    setIncome(null); setExpenses(null); setStatements(null); setInsuranceRates(null);
+    if (window.Clerk) await window.Clerk.signOut().catch(() => {});
   }
 
   async function loadData() {
@@ -475,7 +493,10 @@ function App() {
     return <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#8a90a0', fontSize: '14px' }}>Loading…</div>;
   }
   if (authState === 'signed-out') {
-    return <LoginScreen clientId={clientId} onSignedIn={handleSignedIn} authError={authError} />;
+    return <LoginScreen clerkReady={clerkReady} configError={configError} />;
+  }
+  if (authState === 'not-authorized') {
+    return <NotAuthorizedScreen email={attemptedEmail} onSignOut={handleLogout} />;
   }
   if (income === null || expenses === null || statements === null || insuranceRates === null) {
     return (

@@ -6,12 +6,12 @@ services:
     buildCommand: npm install
     startCommand: npm start
     envVars:
-      - key: GOOGLE_CLIENT_ID
+      - key: CLERK_PUBLISHABLE_KEY
+        sync: false
+      - key: CLERK_SECRET_KEY
         sync: false
       - key: ALLOWED_EMAIL
         sync: false
-      - key: SESSION_SECRET
-        generateValue: true
       - key: DATA_DIR
         value: /data
     disk:

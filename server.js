@@ -1,55 +1,25 @@
 require('dotenv').config();
 const path = require('path');
 const express = require('express');
-const cookieSession = require('cookie-session');
-const { verifyGoogleCredential, requireAuth, CLIENT_ID } = require('./lib/auth');
+const { requireAuth, PUBLISHABLE_KEY } = require('./lib/auth');
 const store = require('./lib/store');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-if (!process.env.SESSION_SECRET) {
-  console.warn('WARNING: SESSION_SECRET is not set in .env — using an insecure default. Set it before real use.');
-}
-
 app.use(express.json());
-app.use(cookieSession({
-  name: 'ddit_session',
-  secret: process.env.SESSION_SECRET || 'insecure-dev-secret-change-me',
-  maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
-  httpOnly: true,
-  sameSite: 'lax'
-}));
 
 // ---------- Auth ----------
+// Clerk handles sign-in/sign-up/sign-out entirely client-side. Every API request
+// below carries a Clerk session token as a Bearer header, which requireAuth verifies
+// (and checks the account's email against ALLOWED_EMAIL) — no server-side session state.
 
 app.get('/api/auth/config', (req, res) => {
-  res.json({ clientId: CLIENT_ID || null });
+  res.json({ publishableKey: PUBLISHABLE_KEY || null });
 });
 
-app.post('/api/auth/google', async (req, res) => {
-  try {
-    const { credential } = req.body;
-    if (!credential) return res.status(400).json({ error: 'Missing credential' });
-    const { email, name, picture } = await verifyGoogleCredential(credential);
-    req.session.email = email;
-    res.json({ authenticated: true, email, name, picture });
-  } catch (e) {
-    res.status(401).json({ error: e.message || 'Authentication failed' });
-  }
-});
-
-app.post('/api/auth/logout', (req, res) => {
-  req.session = null;
-  res.json({ ok: true });
-});
-
-app.get('/api/auth/me', (req, res) => {
-  if (req.session && req.session.email) {
-    res.json({ authenticated: true, email: req.session.email });
-  } else {
-    res.json({ authenticated: false });
-  }
+app.get('/api/auth/me', requireAuth, (req, res) => {
+  res.json({ authenticated: true, email: req.userEmail });
 });
 
 // ---------- Data ----------
