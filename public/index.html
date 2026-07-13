@@ -26,8 +26,9 @@ const { useState, useEffect, useRef } = React;
 
 const PLATFORM_COLORS = {
   'Uber': '#06C167', 'Uber Eats': '#05a356', 'Lyft': '#EA0B8C', 'Skip the Dishes': '#FF8000',
-  'DoorDash': '#EF4444', 'Instacart': '#43B02A', 'Other': '#8b93a3'
+  'DoorDash': '#EF4444', 'Instacart': '#43B02A', 'Spotify': '#1DB954', 'Other': '#8b93a3'
 };
+const PLATFORM_OPTIONS = ['Uber', 'Uber Eats', 'Lyft', 'Skip the Dishes', 'DoorDash', 'Instacart', 'Spotify', 'Other'];
 const CATEGORY_COLORS = {
   'Gas': '#f2b26b', 'Maintenance': '#e06b8b', 'Phone Bill': '#6ba7f2', 'Car Wash': '#6bd0f2',
   'Parking/Tolls': '#c39bf0', 'Car Loan': '#34d399', 'Insurance': '#0ea5e9', 'Platform Fees': '#f0b429',
@@ -92,11 +93,18 @@ function startOfWeek(d) { const x = new Date(d); const day = x.getDay(); const d
 function endOfWeek(d) { const s = startOfWeek(d); const e = new Date(s); e.setDate(e.getDate() + 6); e.setHours(23,59,59,999); return e; }
 function startOfMonth(d) { return new Date(d.getFullYear(), d.getMonth(), 1); }
 function endOfMonth(d) { return new Date(d.getFullYear(), d.getMonth()+1, 0, 23,59,59,999); }
-function inPeriod(dateStr, period, today) {
+function inPeriod(dateStr, period, today, customStart, customEnd) {
   const d = parseDate(dateStr);
   if (period === 'all') return true;
   if (period === 'week') return d >= startOfWeek(today) && d <= endOfWeek(today);
   if (period === 'month') return d >= startOfMonth(today) && d <= endOfMonth(today);
+  if (period === 'custom') {
+    if (!customStart || !customEnd) return true;
+    const s = parseDate(customStart);
+    const e = parseDate(customEnd);
+    e.setHours(23, 59, 59, 999);
+    return d >= s && d <= e;
+  }
   return true;
 }
 
@@ -282,6 +290,8 @@ function App() {
 
   const [tab, setTab] = useState('overview');
   const [period, setPeriod] = useState('week');
+  const [customStart, setCustomStart] = useState('');
+  const [customEnd, setCustomEnd] = useState('');
 
   const [showIncomeForm, setShowIncomeForm] = useState(false);
   const [editingIncomeId, setEditingIncomeId] = useState(null);
@@ -511,6 +521,7 @@ function App() {
       userEmail={userEmail} onLogout={handleLogout}
       income={income} expenses={expenses} statements={statements} insuranceRates={insuranceRates}
       tab={tab} setTab={setTab} period={period} setPeriod={setPeriod}
+      customStart={customStart} setCustomStart={setCustomStart} customEnd={customEnd} setCustomEnd={setCustomEnd}
       showIncomeForm={showIncomeForm} setShowIncomeForm={setShowIncomeForm}
       editingIncomeId={editingIncomeId} incomeForm={incomeForm} setIncomeForm={setIncomeForm}
       incomeFormError={incomeFormError} submitIncome={submitIncome} editIncome={editIncome} removeIncome={removeIncome}
@@ -536,6 +547,7 @@ function Dashboard(p) {
   const today = new Date();
   const income = p.income, expenses = p.expenses, statements = p.statements, insuranceRates = p.insuranceRates;
   const period = p.period, tab = p.tab;
+  const customStart = p.customStart, customEnd = p.customEnd;
 
   const schedule = buildLoanSchedule();
   const recurring = getRecurringExpenses(schedule, today, insuranceRates);
@@ -547,16 +559,21 @@ function Dashboard(p) {
 
   const allExpenses = [...expenses, ...recurring, ...stmtFeeExpenses];
 
-  const periodIncome = income.filter(r => inPeriod(r.date, period, today));
-  const periodStatements = statements.filter(s => inPeriod(localISO(stmtDate(s)), period, today));
-  const periodExpenses = allExpenses.filter(r => inPeriod(r.date, period, today));
+  const spotifyOk = (platform, dateStr) => platform !== 'Spotify' || inPeriod(dateStr, 'month', today);
+
+  const periodIncome = income.filter(r => inPeriod(r.date, period, today, customStart, customEnd) && spotifyOk(r.platform, r.date));
+  const periodStatements = statements.filter(s => inPeriod(localISO(stmtDate(s)), period, today, customStart, customEnd) && spotifyOk(s.platform, localISO(stmtDate(s))));
+  const periodExpenses = allExpenses.filter(r => inPeriod(r.date, period, today, customStart, customEnd));
 
   const gross = periodIncome.reduce((s,r) => s + r.amount, 0) + periodStatements.reduce((s,r) => s + stmtIncome(r), 0);
   const totalExp = periodExpenses.reduce((s,r) => s + r.amount, 0);
   const net = gross - totalExp;
   const margin = gross > 0 ? Math.round((net/gross)*100) : 0;
 
-  const periodLabelMap = { week: 'This week', month: 'This month', all: 'All time' };
+  const periodLabelMap = {
+    week: 'This week', month: 'This month', all: 'All time',
+    custom: (customStart && customEnd) ? (fmtDateShort(parseDate(customStart)) + ' – ' + fmtDateShort(parseDate(customEnd))) : 'Custom range'
+  };
 
   const platMap = {}; const platHours = {};
   periodIncome.forEach(r => {
@@ -724,6 +741,23 @@ function Dashboard(p) {
     background: p.taxView === name ? '#eef1f5' : 'transparent', color: p.taxView === name ? '#14171f' : '#6b7280'
   });
 
+  function exportCSV() {
+    const rows = [['Type', 'Date', 'Platform/Category', 'Amount', 'Note']];
+    periodIncome.forEach(r => rows.push(['Income', r.date, r.platform, r.amount.toFixed(2), r.hours ? r.hours + 'h' : '']));
+    periodStatements.forEach(s => rows.push(['Statement income', localISO(stmtDate(s)), s.platform, stmtIncome(s).toFixed(2), '']));
+    periodExpenses.forEach(r => rows.push(['Expense', r.date, r.category, r.amount.toFixed(2), r.note || '']));
+    const csv = rows.map(row => row.map(v => '"' + String(v).replace(/"/g, '""') + '"').join(',')).join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'driveledger-' + period + '-' + todayStr() + '.csv';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
   const totals = { grossLabel: money(gross), expensesLabel: money(totalExp), netLabel: money(net), grossSubLabel, netColor: net >= 0 ? '#059669' : '#dc6547', marginLabel: gross > 0 ? margin + '% margin' : '—' };
   const loan = {
     principalLabel: money(LOAN.principal), paymentLabel: money(LOAN.payment), balanceLabel: money(currentBalance), paidSoFarLabel: money(paidSoFar),
@@ -740,12 +774,23 @@ function Dashboard(p) {
             <div style={{ width: '36px', height: '36px', borderRadius: '10px', background: 'linear-gradient(135deg,#34d399,#0ea5e9)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: "'Space Grotesk',sans-serif", fontWeight: 700, color: '#08120e', fontSize: '16px' }}>D</div>
             <div style={{ fontFamily: "'Space Grotesk',sans-serif", fontWeight: 700, fontSize: '19px', letterSpacing: '-0.2px' }}>DriveLedger</div>
           </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '14px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '14px', flexWrap: 'wrap' }}>
             <div style={{ display: 'flex', background: '#ffffff', border: '1px solid #e6e8ec', borderRadius: '10px', padding: '3px' }}>
               <button style={periodBtn('week')} onClick={() => p.setPeriod('week')}>Week</button>
               <button style={periodBtn('month')} onClick={() => p.setPeriod('month')}>Month</button>
               <button style={periodBtn('all')} onClick={() => p.setPeriod('all')}>All time</button>
+              <button style={periodBtn('custom')} onClick={() => p.setPeriod('custom')}>Custom</button>
             </div>
+            {period === 'custom' && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <input type="date" value={customStart} onChange={e => p.setCustomStart(e.target.value)}
+                  style={{ background: '#f5f6f8', border: '1px solid #e2e5ea', color: '#14171f', padding: '7px 8px', borderRadius: '7px', fontSize: '12.5px' }} />
+                <span style={{ color: '#8a90a0', fontSize: '12px' }}>to</span>
+                <input type="date" value={customEnd} onChange={e => p.setCustomEnd(e.target.value)}
+                  style={{ background: '#f5f6f8', border: '1px solid #e2e5ea', color: '#14171f', padding: '7px 8px', borderRadius: '7px', fontSize: '12.5px' }} />
+              </div>
+            )}
+            <button onClick={exportCSV} style={{ background: '#f5f6f8', border: '1px solid #e2e5ea', color: '#14171f', fontSize: '12.5px', fontWeight: 600, padding: '9px 14px', borderRadius: '8px', cursor: 'pointer', whiteSpace: 'nowrap' }}>⬇ Export data</button>
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12.5px', color: '#6b7280' }}>
               <span>{p.userEmail}</span>
               <button onClick={p.onLogout} style={{ background: 'none', border: '1px solid #e2e5ea', color: '#6b7280', borderRadius: '7px', padding: '6px 10px', fontSize: '12px', cursor: 'pointer' }}>Sign out</button>
@@ -908,7 +953,7 @@ function IncomeTab({ p, incomeList, incomeCountLabel, stmtList, incomeViewBtn, e
                 <div>
                   <FieldLabel>PLATFORM</FieldLabel>
                   <select style={fieldInputStyle} value={sf.platform} onChange={e => p.setStatementForm({ ...sf, platform: e.target.value })}>
-                    {['Uber','Uber Eats','Lyft','Skip the Dishes','DoorDash','Instacart','Other'].map(o => <option key={o} value={o}>{o}</option>)}
+                    {PLATFORM_OPTIONS.map(o => <option key={o} value={o}>{o}</option>)}
                   </select>
                 </div>
                 <div>
@@ -975,7 +1020,7 @@ function IncomeTab({ p, incomeList, incomeCountLabel, stmtList, incomeViewBtn, e
                 <div>
                   <FieldLabel>PLATFORM</FieldLabel>
                   <select style={fieldInputStyle} value={f.platform} onChange={e => p.setIncomeForm({ ...f, platform: e.target.value })}>
-                    {['Uber','Uber Eats','Lyft','Skip the Dishes','DoorDash','Instacart','Other'].map(o => <option key={o} value={o}>{o}</option>)}
+                    {PLATFORM_OPTIONS.map(o => <option key={o} value={o}>{o}</option>)}
                   </select>
                 </div>
                 <div><FieldLabel>DATE</FieldLabel><input type="date" style={fieldInputStyle} value={f.date} onChange={e => p.setIncomeForm({ ...f, date: e.target.value })} /></div>
