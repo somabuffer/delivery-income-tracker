@@ -1,18 +1,19 @@
 require('dotenv').config();
 const path = require('path');
 const express = require('express');
-const { requireAuth, PUBLISHABLE_KEY } = require('./lib/auth');
+const { clerkMiddleware, requireAuth, PUBLISHABLE_KEY } = require('./lib/auth');
 const store = require('./lib/store');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
+app.use(clerkMiddleware());
 
 // ---------- Auth ----------
 // Clerk handles sign-in/sign-up/sign-out entirely client-side. Every API request
-// below carries a Clerk session token as a Bearer header, which requireAuth verifies
-// (and checks the account's email against ALLOWED_EMAIL) — no server-side session state.
+// below carries a Clerk session token as a Bearer header, which clerkMiddleware()
+// decodes and requireAuth then checks against ALLOWED_EMAIL — no server-side session state.
 
 app.get('/api/auth/config', (req, res) => {
   res.json({ publishableKey: PUBLISHABLE_KEY || null });

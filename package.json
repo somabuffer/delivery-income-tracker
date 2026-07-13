@@ -8,7 +8,7 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "@clerk/backend": "^3.11.4",
+    "@clerk/express": "^2.1.40",
     "dotenv": "^16.4.5",
     "express": "^4.19.2"
   }
